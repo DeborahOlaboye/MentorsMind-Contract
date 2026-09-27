@@ -564,3 +564,62 @@ fn test_get_kyc_record_authorized_returns_expected_data() {
     assert_eq!(record.kyc_provider_hash, provider_hash);
 }
 
+#[test]
+fn test_batch_revoke_kyc_revokes_multiple_users() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let user3 = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let provider_hash = BytesN::from_array(&env, &[0; 32]);
+    let expiry = 5000;
+
+    // Set KYC for 3 users
+    client.set_kyc_level(&admin, &user1, &KycLevel::Basic, &expiry, &provider_hash);
+    client.set_kyc_level(&admin, &user2, &KycLevel::Enhanced, &expiry, &provider_hash);
+    client.set_kyc_level(&admin, &user3, &KycLevel::Institutional, &expiry, &provider_hash);
+
+    // Verify they are KYC-verified
+    assert_eq!(client.get_kyc_level(&user1), KycLevel::Basic);
+    assert_eq!(client.get_kyc_level(&user2), KycLevel::Enhanced);
+    assert_eq!(client.get_kyc_level(&user3), KycLevel::Institutional);
+
+    // Batch revoke the 3 users
+    let mut users_to_revoke = Vec::new(&env);
+    users_to_revoke.push_back(user1.clone());
+    users_to_revoke.push_back(user2.clone());
+    users_to_revoke.push_back(user3.clone());
+    client.batch_revoke_kyc(&admin, &users_to_revoke);
+
+    // Verify they are no longer KYC-verified
+    assert_eq!(client.get_kyc_level(&user1), KycLevel::None);
+    assert_eq!(client.get_kyc_level(&user2), KycLevel::None);
+    assert_eq!(client.get_kyc_level(&user3), KycLevel::None);
+}
+
+#[test]
+#[should_panic(expected = "Batch size exceeds maximum")]
+fn test_batch_revoke_kyc_rejects_oversized_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let mut users = Vec::new(&env);
+    for _i in 0..101 {
+        users.push_back(Address::generate(&env));
+    }
+
+    client.batch_revoke_kyc(&admin, &users);
+}
+
