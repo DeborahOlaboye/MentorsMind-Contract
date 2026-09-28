@@ -1,12 +1,24 @@
 #![no_std]
 
+use shared::pause_guard::require_not_paused;
+use shared::admin::{AdminTransfer, AdminChangeProposal, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS};
 use shared::{
-    require_not_paused, AtomicBatch, BatchOp, ReentrancyGuard, StateSnapshot, Validator,
-    validate_amount_limits, validate_caller_is_authorized,
-    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, BASIS_POINTS, SuspiciousPatternFlag,
+    AtomicBatch, BatchOp, ReentrancyGuard, StateSnapshot, Validator,
+    validate_amount_limits, validate_caller_is_authorized, MAX_BATCH_SIZE,
     detect_price_coordination, validate_market_rate,
     enforce_fair_pricing as shared_enforce_fair_pricing, FairPricingResult, MarketRateValidation,
     PriceCoordinationFlag, DEFAULT_MAX_MARKET_DEVIATION_BPS,
+    detect_atomic_arbitrage, enforce_protocol_isolation,
+    // resource management
+    manage_session_load, check_emergency_trigger,
+    // platform authenticity
+    detect_fee_evasion, PenaltyTier,
+    // dynamic fees
+    calculate_dynamic_fee, detect_fee_gaming,
+};
+use shared::economic_verification::{
+    validate_fund_conservation, validate_reward_distribution, record_invariant_check,
+    EconomicInvariant, EconomicInvariantRecord, RewardAllocation,
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -43,11 +55,11 @@ pub trait OracleContractTrait {
 pub trait StakingCoordinationTrait {
     /// Push the scheduled-next-distribution timestamp into the staking
     /// contract so its pattern detector can flag large late stakes.
-    fn set_next_scheduled_distribution_at(
+    fn set_next_distribution_at(
         env: Env,
         admin: Address,
         timestamp: u64,
-    ) -> Result<(), shared::SharedError>;
+    ) -> Result<(), soroban_sdk::Error>;
 
     /// Eligible-total denominator for an already-closed epoch. Used by the
     /// treasury for off-chain audit verification: the treasury confirms
@@ -124,6 +136,9 @@ pub enum Error {
     DuplicateEntry = 21,
     Overflow = 22,
     OracleCircuitBreaker = 23,
+    CoolingOffPeriod = 24,
+    TimelockNotExpired = 25,
+    SuspendedDuringAdminTransfer = 26,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +152,15 @@ pub struct AllocationHistory {
     pub recipient: Address,
     pub amount: i128,
     pub timestamp: u64,
+}
+
+/// A single item in a [`TreasuryContract::batch_allocate`] request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocationRequest {
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -299,6 +323,20 @@ pub enum DataKey {
     /// used to detect coordinated price setting.
     RecentPricesForToken(Address),
     RecentPriceTimestampsForToken(Address),
+    // -----------------------------------------------------------------------
+    // MEV Protection keys
+    // -----------------------------------------------------------------------
+    MevInteractionCount(Address, u32),
+    // -----------------------------------------------------------------------
+    // Economic Audit
+    // -----------------------------------------------------------------------
+    TotalDeposits(Address),
+    DepositCount(Address),
+    // ── Economic monitoring & fairness audit (#903) ────────────────────────
+    /// Token flow monitoring record for a distribution epoch.
+    TokenFlowRecord(u64),
+    /// Fairness audit result for a distribution.
+    FairnessAuditRecord(u64),
 }
 
 /// Maximum length of the rolling per-token price log kept for coordination scoring.
@@ -344,9 +382,6 @@ impl TreasuryContract {
         env.storage()
             .persistent()
             .set(&DataKey::OperationLogCount, &0u64);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RegulatoryReporting, &Address::generate(&env));
         env.storage()
             .persistent()
             .set(&DataKey::TreasuryContractSelf, &env.current_contract_address());
@@ -740,7 +775,7 @@ impl TreasuryContract {
             .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
         {
             use soroban_sdk::IntoVal;
-            let _ = env.try_invoke_contract::<(), _>(
+            let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &reporting_addr,
                 &Symbol::new(env, "record_large_tx"),
                 (
@@ -798,6 +833,14 @@ impl TreasuryContract {
             return Err(Error::ReentrancyGuardPaused);
         }
         Ok(())
+    }
+
+    fn _track_mev_interaction(env: &Env, caller: &Address) -> u32 {
+        let key = DataKey::MevInteractionCount(caller.clone(), env.ledger().sequence());
+        let mut count: u32 = env.storage().temporary().get(&key).unwrap_or(0);
+        count += 1;
+        env.storage().temporary().set(&key, &count);
+        count
     }
 
     fn _is_token_approved(env: &Env, token: &Address) -> bool {
@@ -858,6 +901,20 @@ impl TreasuryContract {
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "deposit"));
 
         from.require_auth();
+
+        // ── Rate Limiting & Emergency Throttling ─────────────────────────────────
+        let req_count = Self::_track_mev_interaction(&env, &from);
+        
+        let global_reqs: u32 = env.storage().temporary().get(&DataKey::NamespaceRoot).unwrap_or(0) + 1;
+        env.storage().temporary().set(&DataKey::NamespaceRoot, &global_reqs);
+        
+        let is_emergency = check_emergency_trigger(global_reqs);
+        let limit_status = manage_session_load(&env, req_count, is_emergency);
+        if !limit_status.allowed {
+            return Err(Error::ReentrancyGuardPaused); // Treat as throttled
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
         Validator::new(&env)
             .require_positive(amount, "amount")
             .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
@@ -876,6 +933,27 @@ impl TreasuryContract {
 
         let balance_after: i128 =
             token::Client::new(&env, &token).balance(&env.current_contract_address());
+
+        // ── Economic Audit ───────────────────────────────────────────────────────
+        let dep_count_key = DataKey::DepositCount(from.clone());
+        let total_dep_key = DataKey::TotalDeposits(from.clone());
+        
+        let count: u32 = env.storage().persistent().get(&dep_count_key).unwrap_or(0) + 1;
+        let total: i128 = env.storage().persistent().get(&total_dep_key).unwrap_or(0) + amount;
+        
+        env.storage().persistent().set(&dep_count_key, &count);
+        env.storage().persistent().set(&total_dep_key, &total);
+        
+        // Expected fee of 100_000 tokens on average per deposit (example baseline)
+        let expected_avg: i128 = 100_000;
+        let actual_avg = total / (count as i128);
+        
+        let audit = detect_fee_evasion(&env, expected_avg, actual_avg);
+        if audit.penalty_tier == PenaltyTier::PermanentBan || audit.penalty_tier == PenaltyTier::TemporarySuspension {
+            return Err(Error::CallerNotAuthorized); // Block deposit if suspended for fee evasion
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
         if balance_after.checked_sub(balance_before) != Some(amount) {
             return Err(Error::InsufficientBalance);
         }
@@ -944,6 +1022,23 @@ impl TreasuryContract {
         let auth_callers = Self::get_authorized_callers(&env);
         if !validate_caller_is_authorized(&env, &admin, &auth_callers) {
             return Err(Error::CallerNotAuthorized);
+        }
+
+        // ── Rate Limiting & Emergency Throttling ─────────────────────────────────
+        let interactions = Self::_track_mev_interaction(&env, &admin);
+        let global_reqs: u32 = env.storage().temporary().get(&DataKey::NamespaceRoot).unwrap_or(0) + 1;
+        env.storage().temporary().set(&DataKey::NamespaceRoot, &global_reqs);
+        
+        let is_emergency = check_emergency_trigger(global_reqs);
+        let limit_status = manage_session_load(&env, interactions, is_emergency);
+        if !limit_status.allowed {
+            return Err(Error::ReentrancyGuardPaused); // Treat as throttled
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
+        let mev_flag = detect_atomic_arbitrage(&env, &admin, interactions);
+        if !enforce_protocol_isolation(&mev_flag) {
+            return Err(Error::ReentrancyGuardPaused); // Treat as isolated/blocked
         }
 
         let pre_snapshot = StateSnapshot::capture(&env);
@@ -1029,20 +1124,19 @@ impl TreasuryContract {
             recipient.clone(),
             amount,
         );
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
 
         let token_ref = token.clone();
         let recipient_ref = recipient.clone();
         let amount_ref = amount;
 
         batch.execute_all(|e, op| match op {
-            BatchOp::Transfer {
-                token, from, to, amount, ..
-            } => {
+            BatchOp::Transfer(token, from, to, amount, _) => {
                 token::Client::new(e, token).transfer(from, to, amount);
                 Ok(())
             }
             _ => Ok(()),
-        }).map_err(|_e| Error::InvalidAmount)?;
+        }).map_err(|_e: shared::reentrancy_guard::BatchValidationError| Error::InvalidAmount)?;
 
         let balance_after: i128 =
             token::Client::new(&env, &token_ref).balance(&env.current_contract_address());
@@ -1051,6 +1145,20 @@ impl TreasuryContract {
         }
         let recipient_balance = token::Client::new(&env, &token_ref).balance(&recipient_ref);
         if recipient_balance < amount_ref {
+            return Err(Error::StateValidationFailed);
+        }
+        let conservation = validate_fund_conservation(
+            &env, balance_before, 0, amount_ref, 0, balance_after,
+        );
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::FundConservation,
+            valid: conservation.valid,
+            observed: conservation.observed,
+            expected: conservation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        if !conservation.valid {
             return Err(Error::StateValidationFailed);
         }
         pre_snapshot.assert_valid();
@@ -1087,6 +1195,163 @@ impl TreasuryContract {
             (symbol_short!("allocate"), recipient.clone(), token.clone()),
             amount,
         );
+        Ok(())
+    }
+
+    /// Allocate to multiple recipients atomically (#830).
+    ///
+    /// Every request is fully pre-validated (token approved, amount sane,
+    /// per-tx cap respected, sufficient balance for the batch's total)
+    /// *before* a single transfer runs, so a request that would fail never
+    /// leaves the contract partway through a payout. Execution then runs
+    /// through [`AtomicBatch`], which stops at the first failing transfer;
+    /// since this function propagates that failure as `Err`, Soroban
+    /// reverts every transfer already made in this call — the batch either
+    /// lands in full or not at all.
+    ///
+    /// Unlike [`allocate`](Self::allocate), items above `MultisigThreshold`
+    /// are rejected outright rather than queued for approval — batch
+    /// requests are for below-threshold, routine payouts; a large transfer
+    /// should go through the single-item `allocate` pending-approval path.
+    pub fn batch_allocate(
+        env: Env,
+        requests: Vec<AllocationRequest>,
+    ) -> Result<(), Error> {
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
+        let lock_sym = Symbol::new(&env, "batch_allocate");
+        Self::_require_not_rg_paused(&env, &lock_sym)?;
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
+
+        let admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if requests.is_empty() || requests.len() > MAX_BATCH_SIZE {
+            return Err(Error::InvalidAmount);
+        }
+
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .unwrap_or(50_000);
+
+        // --- Pre-execution validation: every request must be individually
+        // valid, and the batch's total must not exceed the contract's
+        // current balance per token, before any transfer is attempted. ---
+        let mut totals_by_first_use: Vec<(Address, i128)> = Vec::new(&env);
+        for req in requests.iter() {
+            if !Self::_is_token_approved(&env, &req.token) {
+                return Err(Error::TokenNotApproved);
+            }
+            Validator::new(&env)
+                .require_positive(req.amount, "amount")
+                .require_max(req.amount, MAX_FINANCIAL_AMOUNT, "amount")
+                .validate()
+                .map_err(|_| Error::InvalidAmount)?;
+            if !validate_amount_limits(req.amount, 1, MAX_PER_TX_ALLOCATE) {
+                return Err(Error::AmountExceedsLimit);
+            }
+            if req.amount > threshold {
+                return Err(Error::AmountExceedsLimit);
+            }
+
+            let mut found = false;
+            for i in 0..totals_by_first_use.len() {
+                let (tok, running) = totals_by_first_use.get(i).unwrap();
+                if tok == req.token {
+                    totals_by_first_use.set(
+                        i,
+                        (tok, running.checked_add(req.amount).ok_or(Error::InvalidAmount)?),
+                    );
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                totals_by_first_use.push_back((req.token.clone(), req.amount));
+            }
+        }
+        for (tok, total) in totals_by_first_use.iter() {
+            let balance: i128 = token::Client::new(&env, &tok).balance(&env.current_contract_address());
+            if balance < total {
+                return Err(Error::InsufficientBalance);
+            }
+        }
+
+        // --- Execution: queue every transfer, then run them in order,
+        // aborting (and letting Soroban revert everything) at the first
+        // failure. ---
+        let mut batch = AtomicBatch::new(&env);
+        for req in requests.iter() {
+            batch.add_transfer(
+                req.token.clone(),
+                env.current_contract_address(),
+                req.recipient.clone(),
+                req.amount,
+            );
+        }
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
+
+        batch
+            .execute_all(|e, op| -> Result<(), Error> {
+                match op {
+                    BatchOp::Transfer(token, from, to, amount, _) => {
+                        token::Client::new(e, token).transfer(from, to, amount);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            })
+            .map_err(|_e| Error::StateValidationFailed)?;
+
+        // --- Audit trail: one AllocationHistory + operation log entry per
+        // request, plus a summary event for the whole batch. ---
+        for req in requests.iter() {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllocationCount)
+                .unwrap_or(0u32);
+            env.storage().persistent().set(
+                &DataKey::Allocation(count),
+                &AllocationHistory {
+                    token: req.token.clone(),
+                    recipient: req.recipient.clone(),
+                    amount: req.amount,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllocationCount, &(count + 1));
+
+            Self::_log_operation(
+                &env,
+                Symbol::new(&env, "batch_allocate"),
+                admin.clone(),
+                req.token.clone(),
+                req.amount,
+                Some(req.recipient.clone()),
+                true,
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("batch"), symbol_short!("alloc_ok")),
+            (requests.len(), env.ledger().timestamp()),
+        );
+
         Ok(())
     }
 
@@ -1257,9 +1522,9 @@ impl TreasuryContract {
         // to understand this new entry point we ignore the failure — the
         // treasury itself still enforces the minimum-interval gate so
         // the deployment is safe either way.
-        let _ = env.try_invoke_contract::<(), _>(
+        let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
             &staking,
-            &Symbol::new(&env, "set_next_scheduled_distribution_at"),
+            &Symbol::new(&env, "set_next_distribution_at"),
             (admin.clone(), distribution_at).into_val(&env),
         );
 
@@ -1274,7 +1539,7 @@ impl TreasuryContract {
     /// matching `schedule_staker_distribution`. Default is `false`
     /// (backwards compatible). Governance can flip to `true` once the
     /// protocol is ready to commit to fully-announced schedules.
-    pub fn set_require_scheduled_distribution(
+    pub fn set_require_sched_distrib(
         env: Env,
         admin: Address,
         require: bool,
@@ -1292,7 +1557,7 @@ impl TreasuryContract {
             .get(&DataKey::ScheduledNextDistributionAt)
     }
 
-    pub fn get_require_scheduled_distribution(env: Env) -> bool {
+    pub fn get_require_sched_distrib(env: Env) -> bool {
         env.storage()
             .persistent()
             .get(&DataKey::RequireScheduledDistribution)
@@ -1352,6 +1617,12 @@ impl TreasuryContract {
         let auth_callers = Self::get_authorized_callers(&env);
         if !validate_caller_is_authorized(&env, &admin, &auth_callers) {
             return Err(Error::CallerNotAuthorized);
+        }
+
+        let interactions = Self::_track_mev_interaction(&env, &admin);
+        let mev_flag = detect_atomic_arbitrage(&env, &admin, interactions);
+        if !enforce_protocol_isolation(&mev_flag) {
+            return Err(Error::ReentrancyGuardPaused);
         }
 
         // -------------------------------------------------------------------
@@ -1444,7 +1715,7 @@ impl TreasuryContract {
             .storage()
             .persistent()
             .get(&DataKey::LastDistributionId)
-            .unwrap_or(0)
+            .unwrap_or(0u64)
             .checked_add(1)
             .ok_or(Error::Overflow)?;
 
@@ -1488,6 +1759,7 @@ impl TreasuryContract {
             staking_contract.clone(),
             Symbol::new(&env, "receive_treasury_distribution"),
         );
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
 
         let staking_ref = staking_contract.clone();
         let token_ref = token.clone();
@@ -1496,15 +1768,11 @@ impl TreasuryContract {
         let treasury_self = env.current_contract_address();
 
         batch.execute_all(|e, op| match op {
-            BatchOp::Transfer {
-                token, from, to, amount, ..
-            } => {
+            BatchOp::Transfer(token, from, to, amount, _) => {
                 token::Client::new(e, token).transfer(from, to, amount);
                 Ok(())
             }
-            BatchOp::Invoke {
-                contract, function, ..
-            } => {
+            BatchOp::Invoke(contract, _function, _) => {
                 let lp_amount = amount_ref / 10;
                 let staker_amount = amount_ref - lp_amount;
 
@@ -1530,7 +1798,7 @@ impl TreasuryContract {
                 );
                 Ok(())
             }
-        }).map_err(|_e| Error::InvalidAmount)?;
+        }).map_err(|_e: shared::reentrancy_guard::BatchValidationError| Error::InvalidAmount)?;
 
         let balance_after: i128 =
             token::Client::new(&env, &token).balance(&env.current_contract_address());
@@ -1540,6 +1808,20 @@ impl TreasuryContract {
         let staking_balance =
             token::Client::new(&env, &token).balance(&staking_ref);
         if staking_balance < total_amount {
+            return Err(Error::StateValidationFailed);
+        }
+        let conservation = validate_fund_conservation(
+            &env, balance_before, 0, total_amount, 0, balance_after,
+        );
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::FundConservation,
+            valid: conservation.valid,
+            observed: conservation.observed,
+            expected: conservation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        if !conservation.valid {
             return Err(Error::StateValidationFailed);
         }
         pre_snapshot.assert_valid();
@@ -1722,7 +2004,7 @@ impl TreasuryContract {
         let mnt_tok = mnt_token.clone();
         let treasury_clone = treasury_addr.clone();
 
-        let mnt_received_result: Result<i128, _> = env.try_invoke_contract(
+        let mnt_received: i128 = env.invoke_contract(
             &dex_contract,
             &swap_fn,
             (
@@ -1734,26 +2016,6 @@ impl TreasuryContract {
             )
                 .into_val(&env),
         );
-
-        let mnt_received = match mnt_received_result {
-            Ok(val) => val,
-            Err(_) => {
-                xlm_client.approve(
-                    &treasury_addr,
-                    &dex_contract,
-                    &0,
-                    &expiration_ledger,
-                );
-                env.events().publish(
-                    (symbol_short!("buyback"), symbol_short!("failed")),
-                    BuybackFailed {
-                        xlm_amount,
-                        reason: Symbol::new(&env, "dex_call_failed"),
-                    },
-                );
-                return Err(Error::ZeroOutput);
-            }
-        };
 
         if mnt_received == 0 {
             xlm_client.approve(
@@ -1892,6 +2154,150 @@ impl TreasuryContract {
             .persistent()
             .get(&DataKey::StakingContract)
             .ok_or(Error::NotInitialized)
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic Fees & Revenue
+    // -----------------------------------------------------------------------
+
+    pub fn calculate_platform_fees(env: Env, amount: i128, system_load: u32, reputation: u32) -> i128 {
+        let dynamic_fee = calculate_dynamic_fee(&env, system_load, reputation);
+        (amount.saturating_mul(dynamic_fee.fee_bps as i128)) / 10000
+    }
+
+    pub fn collect_fees(
+        env: Env, 
+        from: Address, 
+        token: Address, 
+        amount: i128, 
+        system_load: u32, 
+        reputation: u32
+    ) -> Result<i128, Error> {
+        from.require_auth();
+        let fee = Self::calculate_platform_fees(env.clone(), amount, system_load, reputation);
+        
+        let recent_tx = env.storage().persistent().get(&DataKey::DepositCount(from.clone())).unwrap_or(0);
+        let total_vol = env.storage().persistent().get(&DataKey::TotalDeposits(from.clone())).unwrap_or(0);
+        
+        let evasion = detect_fee_gaming(&env, recent_tx, total_vol);
+        if evasion.is_evading {
+            return Err(Error::CallerNotAuthorized); // Gaming detected
+        }
+        
+        Self::deposit(env, from, token, fee)?;
+        Ok(fee)
+    }
+
+    pub fn distribute_fee_revenue(
+        env: Env,
+        admin: Address,
+        token: Address,
+        amount: i128,
+        destination: Address,
+    ) -> Result<(), Error> {
+        let auth_callers = Self::get_authorized_callers(&env);
+        if !validate_caller_is_authorized(&env, &admin, &auth_callers) {
+            return Err(Error::CallerNotAuthorized);
+        }
+        admin.require_auth();
+        
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &destination, &amount);
+        Ok(())
+    }
+
+    // ── Economic monitoring & fairness audit (#903) ────────────────────────
+
+    /// Validates a distribution's allocation vector and emits a monitorable
+    /// violation event when amounts do not reconcile to the declared reward.
+    pub fn verify_reward_allocation(
+        env: Env,
+        total_reward: i128,
+        allocations: Vec<RewardAllocation>,
+    ) -> bool {
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::RewardDistribution,
+            valid: result.valid,
+            observed: result.observed,
+            expected: result.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        result.valid
+    }
+
+    /// Monitor token flows during a distribution to detect manipulation
+    /// patterns such as coordinated timing or excessive extraction.
+    pub fn monitor_token_flows(
+        env: Env,
+        distribution_id: u64,
+    ) -> bool {
+        let receipt: Option<DistributionReceipt> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DistributionReceipt(distribution_id));
+
+        match receipt {
+            None => false,
+            Some(r) => {
+                // Flag if the distribution amount seems disproportionate.
+                let staking_contract = Self::get_staking_contract(env.clone());
+                match staking_contract {
+                    Err(_) => false,
+                    Ok(_) => {
+                        let max_per_tx = MAX_PER_TX_DISTRIBUTE;
+                        r.total_amount > 0 && r.total_amount <= max_per_tx
+                    }
+                }
+            }
+        }
+    }
+
+    /// Audit the fairness of a completed distribution by checking
+    /// that amounts stayed within configured bounds.
+    pub fn audit_distribution_fairness(
+        env: Env,
+        distribution_id: u64,
+    ) -> bool {
+        let receipt: Option<DistributionReceipt> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DistributionReceipt(distribution_id));
+
+        match receipt {
+            None => false,
+            Some(r) => {
+                r.total_amount > 0
+                    && r.total_amount <= MAX_PER_TX_DISTRIBUTE
+                    && r.total_amount <= shared::MAX_FINANCIAL_AMOUNT
+            }
+        }
+    }
+
+    /// Correct a distribution by marking it for review if fairness
+    /// checks fail.
+    pub fn correct_distribution(
+        env: Env,
+        distribution_id: u64,
+    ) -> bool {
+        let is_fair = Self::audit_distribution_fairness(env.clone(), distribution_id);
+        if !is_fair {
+            // Mark the receipt as requiring review by setting processed to false
+            // (in a real implementation this would trigger a governance vote).
+            let receipt: Option<DistributionReceipt> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::DistributionReceipt(distribution_id));
+            if let Some(mut r) = receipt {
+                r.processed = false;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::DistributionReceipt(distribution_id), &r);
+            }
+            return true;
+        }
+        false
     }
 }
 

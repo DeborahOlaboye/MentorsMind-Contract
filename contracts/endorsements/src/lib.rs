@@ -1,7 +1,8 @@
 #![no_std]
 
+use shared::health_reporter::{report_metric, MetricCategory};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contractevent, contractclient, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
 const DECAY_HALF_LIFE_SECS: u64 = 6 * 30 * 24 * 3600; // 6 months in seconds
@@ -18,6 +19,8 @@ pub enum DataKey {
     Endorsers(Address, Symbol),
     EndorsementCount(Address, Symbol),
     EndorsedSkills(Address),
+    /// Address of the health dashboard for metric reporting.
+    HealthDashboard,
 }
 
 #[contracttype]
@@ -56,6 +59,18 @@ pub trait SessionRegistryTrait {
     fn get_session(env: Env, session_id: Symbol) -> SessionRecord;
 }
 
+#[contractevent]
+#[derive(Clone)]
+struct EndorsementChangedEvent {
+    #[topic]
+    action: Symbol,
+    #[topic]
+    endorsee: Address,
+    #[topic]
+    skill: Symbol,
+    endorser: Address,
+}
+
 #[contract]
 pub struct EndorsementsContract;
 
@@ -83,6 +98,19 @@ impl EndorsementsContract {
         env.storage()
             .instance()
             .set(&DataKey::SessionRegistry, &session_registry);
+    }
+
+    /// Set the health dashboard address for metric reporting. Admin only.
+    pub fn set_health_dashboard(env: Env, health_dashboard: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::HealthDashboard, &health_dashboard);
     }
 
     pub fn endorse(env: Env, endorser: Address, endorsee: Address, skill: Symbol) {
@@ -132,8 +160,27 @@ impl EndorsementsContract {
             env.storage().persistent().set(&skills_key, &skills);
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "endorsed"), endorsee, skill), endorser);
+        EndorsementChangedEvent {
+            action: Symbol::new(&env, "endorsed"),
+            endorsee,
+            skill,
+            endorser,
+        }.publish(env);
+
+        // Report health metric for endorsement creation
+        if let Some(dashboard) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "endorsement_created"),
+                MetricCategory::Availability,
+                new_count as i128,
+            );
+        }
     }
 
     pub fn remove_endorsement(env: Env, endorser: Address, endorsee: Address, skill: Symbol) {

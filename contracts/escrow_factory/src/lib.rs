@@ -1,13 +1,23 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, IntoVal, Symbol, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
 
 // Pull in the shared signature-validation utilities.
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
 use shared::GasEstimate;
+use shared::dynamic_fees::{calculate_dynamic_fee, DynamicFeeResult};
+use shared::health_reporter::{report_metric, MetricCategory};
+use shared::CrossContractAuth;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    Unauthorized = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +44,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 /// therefore a different address) instead of colliding.
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
 const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
+const HEALTH_DASHBOARD: Symbol = symbol_short!("HLTH_DB");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -230,6 +241,16 @@ impl EscrowFactory {
             .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
+    /// Set the health dashboard address for metric reporting. Admin only.
+    pub fn set_health_dashboard(env: Env, health_dashboard: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&HEALTH_DASHBOARD, &health_dashboard);
+        env.storage()
+            .persistent()
+            .extend_ttl(&HEALTH_DASHBOARD, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
     pub fn set_anomaly_detector(env: Env, detector: Address) {
         let admin = Self::admin(&env);
         admin.require_auth();
@@ -260,6 +281,11 @@ impl EscrowFactory {
         token: Address,
         session_id: Symbol,
     ) -> Address {
+        let admin = Self::admin(&env);
+        if !CrossContractAuth::verify_caller(&env, &admin) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
         // Check pause guardian
         if let Some(guardian) = env.storage().persistent().get::<_, Address>(&PAUSE_GUARDIAN) {
             let is_paused: bool = env.invoke_contract(
@@ -369,6 +395,11 @@ impl EscrowFactory {
         // Deploy new escrow instance as minimal proxy
         let escrow_address = Self::deploy_minimal_proxy(&env, &implementation, salt);
 
+        // Calculate dynamic fee
+        let system_load: u32 = 0; // Replace with actual load metric
+        let reputation: u32 = 100; // Replace with actual reputation
+        let fee_bps = Self::calculate_escrow_fees(&env, system_load, reputation);
+
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
         let _: () = env.invoke_contract(
@@ -377,7 +408,7 @@ impl EscrowFactory {
             (
                 env.current_contract_address(), // Set factory as admin
                 env.current_contract_address(), // Treasury (placeholder)
-                0u32,                           // Fee bps (placeholder)
+                fee_bps,                        // Fee bps dynamically calculated
                 Vec::<Address>::new(&env),      // Approved tokens (empty for now)
                 72u64 * 60 * 60,                // Auto release delay (72 hours)
             )
@@ -446,6 +477,18 @@ impl EscrowFactory {
                 &registry_addr,
                 &Symbol::new(&env, "register_interface"),
                 (escrow_address.clone(), interface_id, 1u32).into_val(&env),
+            );
+        }
+
+        // Report health metric for escrow creation
+        if let Some(dashboard) = env.storage().persistent().get::<_, Address>(&HEALTH_DASHBOARD) {
+            let count: u64 = env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0);
+            report_metric(
+                &env,
+                &dashboard,
+                Symbol::new(&env, "escrow_created"),
+                MetricCategory::Throughput,
+                count as i128,
             );
         }
 
@@ -705,6 +748,24 @@ impl EscrowFactory {
     /// a `MetaTxPayload` before asking the user to sign.
     pub fn get_nonce(env: Env, signer: Address) -> u64 {
         current_nonce(&env, &signer)
+    }
+
+    fn delegate_call(env: &Env, target: &Address, func: &Symbol, args: &Vec<soroban_sdk::Val>) -> soroban_sdk::Val {
+        env.invoke_contract(target, func, args.clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic Fee Logic
+    // -----------------------------------------------------------------------
+
+    pub fn calculate_escrow_fees(env: &Env, system_load: u32, reputation_score: u32) -> u32 {
+        let result = calculate_dynamic_fee(env, system_load, reputation_score);
+        result.fee_bps
+    }
+
+    pub fn validate_fee_payments(env: &Env, expected_bps: u32, provided_bps: u32) -> bool {
+        // Allow a tiny rounding tolerance if needed, but normally should exactly match
+        expected_bps == provided_bps
     }
 
     // -----------------------------------------------------------------------

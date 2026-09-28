@@ -1,33 +1,115 @@
 #![no_std]
 #![allow(deprecated)]
 #![allow(dead_code, unused_assignments)]
+
+//! # Escrow Contract
+//!
+//! A platform-agnostic escrow service that holds funds between mentors and learners
+//! during paid sessions. Supports standard and milestone-based escrows with dispute
+//! resolution, automatic release, and emergency recovery mechanisms.
+//!
+//! ## Core Workflows
+//!
+//! ### Standard Escrow
+//! 1. Learner calls `create_escrow` to fund the entire session payment upfront
+//! 2. Upon successful session completion, learner calls `release_funds`
+//!    - Alternative: mentor waits for auto-release after `session_end_time + auto_release_delay`
+//! 3. If dispute: either party calls `dispute` → admin calls `resolve_dispute` to split funds
+//! 4. If session cancelled: admin calls `refund` to return full amount to learner
+//!
+//! ### Milestone-Based Escrow
+//! 1. Learner calls `create_milestone_escrow` with multiple deliverable milestones
+//! 2. As each milestone completes: learner calls `complete_milestone` (or mentor waits for auto-release)
+//! 3. If milestone quality issue: learner calls `dispute_milestone` → admin resolves
+//! 4. Upon completion of all milestones, remaining escrowed amount is released
+//!
+//! ### Stuck Escrow Recovery
+//! If `try_auto_release` fails repeatedly (e.g., token transfer temporarily unavailable),
+//! the escrow enters a "stuck" state with exponential backoff:
+//! - Anyone can call `report_stuck_escrow` to flag it after grace period
+//! - `emergency_release` (4-of-7 multisig vote) forcibly releases the funds
+//! - `manual_recovery_release` allows conditional manual intervention
+//!
+//! ## Key Invariants
+//!
+//! - **Fund Conservation**: All escrowed amounts are either released, refunded, or in storage
+//! - **Mutual Exclusivity**: Escrow is in exactly one state (Active, Released, Disputed, etc.)
+//! - **Non-Reentrancy**: Core operations use reentrancy guards to prevent attack vectors
+//! - **Fee Immutability**: Platform fees deducted on release are never refunded mid-session
+//! - **Audit Trail**: Emergency actions create immutable records for compliance
+//!
+//! ## Configuration
+//!
+//! - **Fee**: Configured at initialization; capped at 10% (1000 bps)
+//! - **Auto-Release Delay**: Configurable per deployment; default 7 days
+//! - **Treasury**: Collects platform fees; updatable by admin
+//! - **Approved Tokens**: Whitelist of allowed payment tokens (e.g., USDC, eUSDC)
+//! - **Staking Tiers**: Mentor tier tiers can reduce fees for higher-volume mentors
+//!
+//! ## Fee Structure
+//!
+//! Platform fee is calculated as: `(escrow_amount * fee_bps) / 10_000`
+//! - Applied only on `release_funds`, not on refunds or dispute splits
+//! - Can be dynamic (based on MNT token price) or fixed
+//! - Mentor tier discounts (if fee schedule configured) reduce the effective fee
+//!
+//! ## External Integration
+//!
+//! - **Frontend**: Calls `create_escrow` (learner) and `release_funds` (learner/mentor)
+//! - **Off-Chain Services**: Listen to escrow events to index state and trigger notifications
+//! - **Other Contracts**: Cross-contract calls validated via `set_interface_registry`
+//! - **Governance**: Can propose emergency rollbacks via `propose_emergency_rollback`
+//!
+//! ## Errors & Edge Cases
+//!
+//! Panics (reverts) occur on:
+//! - Unapproved tokens (prevents accidental asset loss)
+//! - Invalid state transitions (released escrow cannot be released again)
+//! - Authorization failures (only proper parties can act)
+//! - Token transfer failures (insufficient balance or token error)
+//!
+//! Most operations emit events for off-chain indexing and user notifications.
+
 use shared::events::{
     emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_emergency_release,
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
 };
 use shared::{
     compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord,
-    RollbackProposal, SnapshotMeta, StateVerificationReport,
+    RollbackProposal, SnapshotMeta, StateVerificationReport, ReentrancyGuard,
     MAX_SNAPSHOTS, EscrowTransitionLog, GasEstimate, Validator, StateMachine,
-    EMERGENCY_THRESHOLD, ReleaseFailure, FailureClassification, RecoveryState,
-    calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
+    ReleaseFailure, FailureClassification, RecoveryState,
+    calculate_next_retry,
     MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD, StateTransitionContext,
-    PreConditionCheck, PostConditionCheck, CrossContractStateCheck, StateTransitionProof,
-    InvalidStateRecord, compute_transition_proof_hash, all_checkpoints_passed,
+    CrossContractStateCheck,
+    InvalidStateRecord,
     is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS, EmergencyAction, EmergencyAdminRole,
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD, EmergencyRollback,
     ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification, RollbackScope,
-    SecureStorageAccess, STORAGE_DERIVE_CTX,
+    SecureStorageAccess, STORAGE_DERIVE_CTX, Pagination, log_contract_error,
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address, Bytes, Env,
-    Symbol, Vec, IntoVal, BytesN,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    xdr::ToXdr, Address, Bytes, Env, Symbol, Vec, IntoVal, BytesN,
 };
 use shared::{
     AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS,
 };
+use shared::{
+    validate_evidence_sufficiency, detect_payment_timing_manipulation, check_multisig_threshold,
+    detect_platform_bypass, verify_session_authenticity, REQUIRED_INTERACTION_MINUTES,
+    EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval,
+    EmergencyFundLock, PaymentAuditEntry,
+};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    SessionAuthFailed = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,6 +284,18 @@ pub struct EmergencyActionAuditEventData {
     pub success: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowInvariantReport {
+    pub escrow_id: u64,
+    pub funds_conserved: bool,
+    pub transition_consistent: bool,
+    pub terminal_state_immutable: bool,
+    pub treasury_consistent: bool,
+    pub violation_count: u32,
+    pub checked_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Admin Events
 // ---------------------------------------------------------------------------
@@ -252,6 +346,14 @@ pub struct FeeAppliedEventData {
     pub base_bps: u32,
     pub effective_bps: u32,
     pub fee_amount: i128,
+}
+
+/// Event data emitted when the graduated fee schedule is updated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeScheduleUpdatedEventData {
+    pub old_schedule: Option<FeeSchedule>,
+    pub new_schedule: FeeSchedule,
 }
 
 /// Cross-contract view of the staking contract used to read a mentor's tier.
@@ -347,6 +449,8 @@ pub enum DataKey {
     EmergencyProposalCount,
     /// Immutable audit record for emergency action `n`.
     EmergencyAudit(u32),
+    /// Latest runtime invariant report for an escrow.
+    EscrowInvariantReport(u64),
     /// Params-hash → permanently failed (blocks retry with same parameters).
     EmergencyFailedParams(BytesN<32>),
     /// Time-bound emergency admin role.
@@ -379,6 +483,26 @@ pub enum DataKey {
     PendingAdminTransfer,
     /// Last admin change timestamp for cooling-off enforcement.
     LastAdminChange,
+    // -----------------------------------------------------------------------
+    // Payment integrity / escrow-gaming protection (#886)
+    // -----------------------------------------------------------------------
+    /// Timestamps of dispute-related actions (open, resolution attempts)
+    /// for a given escrow, used for payment-timing manipulation detection.
+    DisputeActionLog(u64),
+    /// Number of evidence items on record for a given escrow, mirrored
+    /// from the dispute-evidence contract when a secure resolution is
+    /// requested.
+    DisputeEvidenceCount(u64),
+    /// Distinct multisig approvers recorded for a pending secure
+    /// resolution of a given escrow.
+    ResolutionApprovals(u64),
+    /// Whether an escrow's funds are currently isolated due to a detected
+    /// payment-manipulation attack.
+    IsolatedEscrow(u64),
+    /// Number of low-fee sessions released for a mentor/learner pair.
+    LowFeeSessionCount(Address, Address),
+    /// Payment audit trail for a given escrow.
+    PaymentAudit(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +637,29 @@ impl EscrowContract {
     ///   auto-release to the mentor. Pass `0` to use the default (72 hours).
     /// - Approved tokens must satisfy SEP-41 (XLM, USDC, PYUSD, …).
     ///
+    /// Initialize the escrow contract with core configuration parameters.
+    ///
+    /// This function sets up the escrow contract with the admin, token, treasury, and fee settings.
+    /// Must be called exactly once before any escrow operations. Subsequent calls will panic.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `admin`: The admin address that can perform privileged operations
+    /// - `token`: The token contract address (e.g., USDC)
+    /// - `treasury`: The treasury address receiving platform fees
+    /// - `fee_bps`: Initial platform fee in basis points (0-1000, default 500 = 5%)
+    /// - `auto_release_delay`: Time in seconds before escrow auto-releases (default 7 days)
+    ///
+    /// # Preconditions
+    /// - Contract must not have been initialized before
+    /// - `fee_bps` must be ≤ 1000 (10% cap)
+    /// - All addresses must be valid
+    ///
+    /// # Errors
+    /// Panics if called more than once or if `fee_bps` exceeds cap.
+    ///
+    /// # Workflow
+    /// Initialize → Create Escrow → (Release | Dispute | Auto-release)
     /// Calling this a second time will panic — persistent storage ensures the
     /// `ADMIN` key survives ledger archival so the guard cannot be bypassed.
     pub fn initialize(
@@ -682,6 +829,28 @@ impl EscrowContract {
     }
 
     /// Update the platform fee — admin only, capped at 1 000 bps (10%).
+    ///
+    /// Changes the global platform fee applied to all new escrows. The fee is
+    /// calculated as a percentage of the escrowed amount and transferred to the
+    /// treasury upon release. This setting does not retroactively affect already-created escrows.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `new_fee_bps`: New fee in basis points (1 basis point = 0.01%)
+    ///
+    /// # Preconditions
+    /// - Caller must be admin (auth required)
+    /// - `new_fee_bps` must not exceed 1000 (10% cap)
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Caller is not the admin
+    /// - `new_fee_bps` exceeds 1000
+    ///
+    /// # Examples
+    /// - 0 bps = 0% fee
+    /// - 500 bps = 5% fee
+    /// - 1000 bps = 10% fee (maximum)
     pub fn update_fee(env: Env, new_fee_bps: u32) {
         let admin: Address = env
             .storage()
@@ -704,11 +873,33 @@ impl EscrowContract {
     }
 
     /// Get dynamic fee based on MNT/USDC price from liquidity pool.
-    /// Returns fee in basis points (bps).
     ///
-    /// Fee schedule:
+    /// When a graduated `FeeSchedule` is configured, returns the tier-0 base
+    /// rate adjusted by the dynamic price multiplier (compatible with legacy
+    /// callers that expect a single flat bps value).  When no schedule is set,
+    /// falls back to the historical hardcoded price tiers for backward
+    /// compatibility:
     /// - Price < $0.10 → 500 bps (5%)
     /// - Price $0.10–$0.50 → 400 bps (4%)
+    /// Get the current platform fee dynamically based on MNT/USDC price.
+    ///
+    /// If dynamic fee is enabled, this returns a fee adjusted based on MNT token price.
+    /// Falls back to the fixed fee if dynamic pricing is disabled or unavailable.
+    /// Pricing tiers:
+    /// - Price < $0.10 → 500 bps (5%)
+    /// - Price $0.10–$0.50 → 400 bps (4%)
+    /// - Price $0.50–$1.00 → 300 bps (3%)
+    /// - Price > $1.00 → 200 bps (2%)
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    ///
+    /// # Return Value
+    /// Fee in basis points (e.g., 500 = 5%)
+    ///
+    /// # Workflow
+    /// Internally fetches MNT price from the oracle/liquidity pool,
+    /// computes the dynamic fee, caches it, and returns the value.
     /// - Price $0.50–$1.00 → 300 bps (3%)
     /// - Price > $1.00 → 200 bps (2%)
     pub fn get_dynamic_fee(env: Env) -> u32 {
@@ -729,21 +920,60 @@ impl EscrowContract {
             .get(&PRICE_CACHE_TIME)
             .unwrap_or(0);
 
-        if cached_ledger == current_ledger {
-            if let Some(cached_price) = env.storage().instance().get::<_, i128>(&PRICE_CACHE) {
-                return Self::_calculate_fee_from_price(cached_price);
+        let price = if cached_ledger == current_ledger {
+            env.storage().instance().get::<_, i128>(&PRICE_CACHE).unwrap_or(0)
+        } else {
+            let p = Self::_fetch_mnt_usdc_price(&env);
+            env.storage().instance().set(&PRICE_CACHE, &p);
+            env.storage().instance().set(&PRICE_CACHE_TIME, &current_ledger);
+            p
+        };
+
+        match env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule) {
+            Some(schedule) => {
+                let multiplier = Self::_price_multiplier_bps(price);
+                schedule
+                    .tier0_bps
+                    .safe_mul(&env, multiplier as i128)
+                    .safe_div(&env, 10_000) as u32
             }
+            None => Self::_legacy_fee_from_price(price),
         }
-
-        let price = Self::_fetch_mnt_usdc_price(&env);
-
-        env.storage().instance().set(&PRICE_CACHE, &price);
-        env.storage().instance().set(&PRICE_CACHE_TIME, &current_ledger);
-
-        Self::_calculate_fee_from_price(price)
     }
 
-    fn _calculate_fee_from_price(price: i128) -> u32 {
+    /// Returns the price-tier multiplier in basis points applied on top of
+    /// graduated FeeSchedule rates.  A low MNT price raises the multiplier
+    /// (higher fees to compensate for token depreciation); a high MNT price
+    /// lowers it (fees become cheaper as the token appreciates).
+    ///
+    /// Multiplier schedule:
+    /// - Price < $0.10 → 125% (12_500 bps)
+    /// - Price $0.10–$0.50 → 110% (11_000 bps)
+    /// - Price $0.50–$1.00 → 100% (10_000 bps, neutral)
+    /// - Price > $1.00 → 90%  ( 9_000 bps)
+    fn _price_multiplier_bps(price: i128) -> u32 {
+        if price <= 0 {
+            return 10_000;
+        }
+
+        let threshold_010 = 1_000_000;
+        let threshold_050 = 5_000_000;
+        let threshold_100 = 10_000_000;
+
+        if price < threshold_010 {
+            12_500
+        } else if price < threshold_050 {
+            11_000
+        } else if price < threshold_100 {
+            10_000
+        } else {
+            9_000
+        }
+    }
+
+    /// Legacy hardcoded flat-fee price tiers preserved for backward
+    /// compatibility when no graduated FeeSchedule is configured.
+    fn _legacy_fee_from_price(price: i128) -> u32 {
         if price <= 0 {
             return DEFAULT_FEE_BPS;
         }
@@ -800,6 +1030,20 @@ impl EscrowContract {
     }
 
     /// Update the treasury address — admin only.
+    ///
+    /// Changes where platform fees are transferred on escrow release.
+    /// Does not affect already-held fees or pending escrows.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `new_treasury`: The new treasury address to receive fees
+    ///
+    /// # Preconditions
+    /// - Caller must be admin (auth required)
+    /// - `new_treasury` must be a valid address
+    ///
+    /// # Errors
+    /// Panics if caller is not the admin.
     pub fn update_treasury(env: Env, new_treasury: Address) {
         let admin: Address = env
             .storage()
@@ -819,6 +1063,26 @@ impl EscrowContract {
 
     /// Add or remove an approved token (admin only).
     /// Emits a TokenApproved or TokenRejected event.
+    ///
+    /// Maintains a whitelist of token contracts that can be used in escrows.
+    /// Learners can only create escrows with approved tokens. Adding a token to
+    /// the approved list allows new escrows to be created with that token.
+    /// Removing a token does not affect existing escrows but prevents new ones.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `token_address`: The token contract address to add or remove
+    /// - `approved`: `true` to add to whitelist, `false` to remove
+    ///
+    /// # Preconditions
+    /// - Caller must be admin (auth required)
+    /// - `token_address` must be a valid token contract
+    ///
+    /// # Errors
+    /// Panics if caller is not the admin.
+    ///
+    /// # Events
+    /// Emits TokenApprovalEventData with the token address and approval status.
     pub fn set_approved_token(env: Env, token_address: Address, approved: bool) {
         let admin: Address = env
             .storage()
@@ -858,6 +1122,9 @@ impl EscrowContract {
 
     /// Set the graduated fee schedule (admin only). Once set, releases use the
     /// tier-based rates instead of the flat `FeeBps`.
+    ///
+    /// Emits a `FeeScheduleUpdated` event so off-chain indexers can track
+    /// schedule changes.
     pub fn set_fee_schedule(env: Env, admin: Address, schedule: FeeSchedule) {
         let stored_admin: Address = env
             .storage()
@@ -872,7 +1139,99 @@ impl EscrowContract {
             panic!("Caller not authorized");
         }
 
-        // Each tier rate is capped at the same maximum as the flat fee.
+        Self::_validate_fee_schedule(&schedule);
+
+        let old_schedule = env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule);
+
+        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
+            FeeScheduleUpdatedEventData {
+                old_schedule,
+                new_schedule: schedule,
+            },
+        );
+    }
+
+    /// Update individual fields of the existing graduated fee schedule (admin
+    /// only).  Pass `None` for any field you want to leave unchanged.  This
+    /// avoids requiring callers to re-send the entire schedule for a single
+    /// parameter tweak.
+    ///
+    /// Panics if no schedule exists yet — use `set_fee_schedule` first.
+    pub fn update_fee_schedule(
+        env: Env,
+        admin: Address,
+        tier0_bps: Option<u32>,
+        tier1_bps: Option<u32>,
+        tier2_bps: Option<u32>,
+        tier3_bps: Option<u32>,
+        volume_discount_threshold: Option<i128>,
+        volume_discount_bps: Option<u32>,
+    ) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        let mut schedule: FeeSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeSchedule)
+            .expect("No fee schedule set; call set_fee_schedule first");
+
+        let old_schedule = schedule.clone();
+
+        if let Some(v) = tier0_bps {
+            schedule.tier0_bps = v;
+        }
+        if let Some(v) = tier1_bps {
+            schedule.tier1_bps = v;
+        }
+        if let Some(v) = tier2_bps {
+            schedule.tier2_bps = v;
+        }
+        if let Some(v) = tier3_bps {
+            schedule.tier3_bps = v;
+        }
+        if let Some(v) = volume_discount_threshold {
+            schedule.volume_discount_threshold = v;
+        }
+        if let Some(v) = volume_discount_bps {
+            schedule.volume_discount_bps = v;
+        }
+
+        Self::_validate_fee_schedule(&schedule);
+
+        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
+            FeeScheduleUpdatedEventData {
+                old_schedule: Some(old_schedule),
+                new_schedule: schedule,
+            },
+        );
+    }
+
+    /// Validate that all fee-schedule parameters respect the configured
+    /// economic bounds (`MAX_FEE_BPS` ceiling, non-negative discount, etc.).
+    fn _validate_fee_schedule(schedule: &FeeSchedule) {
         if schedule.tier0_bps > MAX_FEE_BPS
             || schedule.tier1_bps > MAX_FEE_BPS
             || schedule.tier2_bps > MAX_FEE_BPS
@@ -880,11 +1239,12 @@ impl EscrowContract {
         {
             panic!("Fee exceeds maximum (1000 bps)");
         }
-
-        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        if schedule.volume_discount_bps > MAX_FEE_BPS {
+            panic!("Volume discount exceeds maximum (1000 bps)");
+        }
+        if schedule.volume_discount_threshold < 0 {
+            panic!("Volume discount threshold must be non-negative");
+        }
     }
 
     /// Get the current fee schedule, if one has been set.
@@ -1028,9 +1388,12 @@ impl EscrowContract {
     /// Compute the graduated platform fee for `mentor` on a session worth
     /// `amount`, returning `(fee, tier, base_bps, effective_bps)`.
     ///
-    /// The mentor's tier selects the base rate; a session whose value exceeds
-    /// the schedule's `volume_discount_threshold` receives an additional
-    /// `volume_discount_bps` reduction (never below zero).
+    /// The mentor's tier selects the base rate.  When dynamic pricing is
+    /// enabled, the MNT/USDC price applies a multiplier on top of the tier
+    /// rate.  Finally, a session whose value exceeds the schedule's
+    /// `volume_discount_threshold` receives an additional
+    /// `volume_discount_bps` reduction (never below zero, capped at
+    /// `MAX_FEE_BPS`).
     fn _compute_fee_with_meta(
         env: &Env,
         schedule: &FeeSchedule,
@@ -1038,30 +1401,130 @@ impl EscrowContract {
         amount: i128,
     ) -> (i128, u32, u32, u32) {
         let tier = Self::_mentor_tier(env, mentor);
-        let base_bps = Self::_tier_bps(schedule, tier);
-        let effective_bps = if amount > schedule.volume_discount_threshold {
+        let tier_base = Self::_tier_bps(schedule, tier);
+
+        let dynamic_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DYNAMIC_FEE_ENABLED)
+            .unwrap_or(true);
+
+        let base_bps = if dynamic_enabled {
+            let current_ledger = env.ledger().sequence();
+            let cached_ledger: u32 = env
+                .storage()
+                .instance()
+                .get(&PRICE_CACHE_TIME)
+                .unwrap_or(0);
+
+            let price = if cached_ledger == current_ledger {
+                env.storage().instance().get::<_, i128>(&PRICE_CACHE).unwrap_or(0)
+            } else {
+                let p = Self::_fetch_mnt_usdc_price(env);
+                env.storage().instance().set(&PRICE_CACHE, &p);
+                env.storage().instance().set(&PRICE_CACHE_TIME, &current_ledger);
+                p
+            };
+
+            let multiplier = Self::_price_multiplier_bps(price);
+            let scaled = tier_base
+                .safe_mul(env, multiplier as i128)
+                .safe_div(env, 10_000) as u32;
+            scaled.min(MAX_FEE_BPS)
+        } else {
+            tier_base
+        };
+
+        let discounted = if amount > schedule.volume_discount_threshold {
             base_bps.saturating_sub(schedule.volume_discount_bps)
         } else {
             base_bps
         };
+        let effective_bps = discounted.min(MAX_FEE_BPS);
+
         let fee = amount
             .safe_mul(&env, effective_bps as i128)
             .safe_div(&env, 10_000);
         (fee, tier, base_bps, effective_bps)
     }
 
+    /// Test-only pure-arithmetic version of `_compute_fee_with_meta` that
+    /// bypasses the `Env`-dependent dynamic-pricing cache and staking-tier
+    /// cross-call.  Accepts a literal tier instead of looking it up.  Used by
+    /// unit tests to verify the tier-mapping + volume-discount math in
+    /// isolation without a full `TestFixture`.
+    #[cfg(test)]
+    fn _compute_fee_with_meta_no_dynamic(
+        schedule: &FeeSchedule,
+        tier: u32,
+        amount: i128,
+    ) -> (i128, u32, u32, u32) {
+        let tier_base = Self::_tier_bps(schedule, tier);
+        let base_bps = tier_base;
+        let discounted = if amount > schedule.volume_discount_threshold {
+            base_bps.saturating_sub(schedule.volume_discount_bps)
+        } else {
+            base_bps
+        };
+        let effective_bps = discounted.min(MAX_FEE_BPS);
+        let fee = amount
+            .checked_mul(effective_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .expect("fee arithmetic overflow in test helper");
+        (fee, tier, base_bps, effective_bps)
+    }
+
     /// Public view: compute the graduated platform fee for a mentor/amount.
+    /// Compute the platform fee for a given mentor and amount.
+    ///
+    /// Calculates the fee that will be charged for an escrow based on the current
+    /// fee schedule and the mentor's tier (if staking contract is configured).
+    /// Returns `(gross_amount * fee_bps) / 10_000`.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `mentor`: The mentor address (used to determine tier-based fee discounts)
+    /// - `amount`: The gross amount to compute fee for
+    ///
+    /// # Return Value
+    /// The platform fee in token smallest units (e.g., stroops for USDC).
+    ///
+    /// # Workflow
+    /// 1. Look up mentor's staking tier (if available)
+    /// 2. Apply tier-based fee discount (if schedule exists)
+    /// 3. Apply dynamic fee if enabled
+    /// 4. Return computed fee amount
     ///
     /// Falls back to the flat `FeeBps` rate when no fee schedule is configured.
     pub fn compute_platform_fee(env: Env, mentor: Address, amount: i128) -> i128 {
+        Self::_compute_fee_unified(&env, &mentor, amount).0
+    }
+
+    /// Unified fee computation used by all release paths.
+    ///
+    /// Resolves the effective rate using either the graduated FeeSchedule
+    /// (with staking-tier + volume discount) or the legacy flat FeeBps.
+    ///
+    /// Returns `(platform_fee, Option<(tier, base_bps, effective_bps)>)` —
+    /// the meta tuple is `Some` only when the graduated schedule was used,
+    /// allowing callers to emit `FeeApplied` events consistently.
+    fn _compute_fee_unified(
+        env: &Env,
+        mentor: &Address,
+        amount: i128,
+    ) -> (i128, Option<(u32, u32, u32)>) {
         match env
             .storage()
             .persistent()
             .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
         {
             Some(schedule) => {
-                let (fee, _, _, _) = Self::_compute_fee_with_meta(&env, &schedule, &mentor, amount);
-                fee
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+                let (fee, tier, base_bps, effective_bps) =
+                    Self::_compute_fee_with_meta(env, &schedule, mentor, amount);
+                (fee, Some((tier, base_bps, effective_bps)))
             }
             None => {
                 let fee_bps: u32 = env
@@ -1069,9 +1532,13 @@ impl EscrowContract {
                     .persistent()
                     .get(&DataKey::FeeBps)
                     .unwrap_or(DEFAULT_FEE_BPS);
-                amount
-                    .safe_mul(&env, fee_bps as i128)
-                    .safe_div(&env, 10_000)
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+                let fee = amount
+                    .safe_mul(env, fee_bps as i128)
+                    .safe_div(env, 10_000);
+                (fee, None)
             }
         }
     }
@@ -1093,8 +1560,41 @@ impl EscrowContract {
     /// Panics if:
     /// - `amount` ≤ 0
     /// - `token_address` is not on the approved whitelist
-    /// - learner's on-chain balance is insufficient
-    /// - Caller is not the learner
+    /// Create a new escrow contract between a mentor and learner.
+    ///
+    /// Transfers the specified `amount` from the learner's wallet to the escrow contract,
+    /// deducts the platform fee, and stores the remainder for the mentor to claim later.
+    /// The escrow enters `Active` state and will auto-release after the configured delay
+    /// if not manually released or disputed.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `mentor`: The mentor receiving the payment upon release
+    /// - `learner`: The learner funding and initially controlling the escrow
+    /// - `amount`: The gross amount in token smallest units (e.g., stroops for USDC)
+    /// - `session_id`: Unique session identifier (e.g., mentor-session timestamp)
+    /// - `token_address`: The token contract to transfer funds in
+    /// - `session_end_time`: Unix timestamp when the session ends (triggers auto-release eligibility)
+    ///
+    /// # Preconditions
+    /// - `token_address` must be in the approved token whitelist
+    /// - `amount` must be positive (> 0)
+    /// - `learner` must have sufficient balance and approve token transfer
+    /// - Caller must be the learner (requester auth)
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Token is not approved
+    /// - Amount is zero or negative
+    /// - Learner has insufficient balance or approval
+    /// - Token transfer fails
+    ///
+    /// # Return Value
+    /// The new escrow ID (u64) for use in release, dispute, or status queries.
+    ///
+    /// # Workflow
+    /// Learner calls create_escrow → funds held in escrow → mentor or learner
+    /// can release, dispute, or auto-release after delay
     pub fn create_escrow(
         env: Env,
         mentor: Address,
@@ -1105,8 +1605,9 @@ impl EscrowContract {
         session_end_time: u64,
         total_sessions: u32,
     ) -> u64 {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("create"), learner.clone());
         Self::_create_escrow_internal(
-            env,
+            env.clone(),
             mentor,
             learner,
             amount,
@@ -1123,9 +1624,38 @@ impl EscrowContract {
 
     /// Release funds to the mentor (called by learner or admin).
     ///
-    /// Calculates the platform fee (`gross * fee_bps / 10_000`), transfers the
-    /// fee to the treasury, and transfers the remainder to the mentor.
+    /// Release the escrowed funds to the mentor and fees to the treasury.
+    ///
+    /// Caller must be either the learner (can release at any time after creation),
+    /// or the mentor (can release after `session_end_time` has passed). Calculates
+    /// the platform fee, transfers it to the treasury, and transfers the remainder
+    /// to the mentor. Transitions escrow to `Released` state.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `caller`: The address initiating the release (learner or mentor)
+    /// - `escrow_id`: The ID of the escrow to release
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` state
+    /// - Caller must be the learner (can release anytime) OR mentor (after session_end_time)
+    /// - Escrow funds must not have been previously released, refunded, or resolved
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Active state
+    /// - Caller is not the learner or mentor
+    /// - Mentor tries to release before session_end_time
+    /// - Token transfer fails (insufficient treasury balance or token error)
+    ///
+    /// # Workflow
+    /// active_escrow → release_funds → funds transferred to mentor + treasury
+    /// Emits EscrowReleased event with mentor address and amounts.
+    ///
+    /// # Gas Estimation
+    /// Use `estimate_release_escrow_cost` to predict gas consumption for this operation.
     pub fn release_funds(env: Env, caller: Address, escrow_id: u64) {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("release"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
             .persistent()
@@ -1141,6 +1671,10 @@ impl EscrowContract {
             panic!("Escrow not active");
         }
 
+        if Self::is_isolated(env.clone(), escrow_id) {
+            panic!("Escrow isolated pending manual review");
+        }
+
         let admin: Address = env
             .storage()
             .persistent()
@@ -1153,14 +1687,49 @@ impl EscrowContract {
         // Auth check: caller must be learner OR admin
         caller.require_auth();
         if caller != escrow.learner && caller != admin {
-            panic!("Caller not authorized");
+            log_contract_error(
+                &env,
+                Symbol::new(&env, "release_funds"),
+                Symbol::new(&env, "unauthorized"),
+                escrow_id as i128,
+                Some(caller.clone()),
+            );
+            panic!(
+                "release_funds: caller is neither the learner nor the admin for escrow {}",
+                escrow_id
+            );
         }
+
+        let interaction_minutes = if escrow.session_end_time > escrow.created_at {
+            ((escrow.session_end_time - escrow.created_at) / 60) as u32
+        } else {
+            REQUIRED_INTERACTION_MINUTES
+        };
+        let authenticity =
+            verify_session_authenticity(&env, interaction_minutes, true);
+        let low_fee_key = DataKey::LowFeeSessionCount(
+            escrow.mentor.clone(),
+            escrow.learner.clone(),
+        );
+        let current_low_fee_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&low_fee_key)
+            .unwrap_or(0);
+        let bypass = detect_platform_bypass(&env, current_low_fee_count, escrow.amount);
+        if !authenticity.is_authentic || bypass.is_colluding {
+            panic_with_error!(&env, Error::SessionAuthFailed);
+        }
+        env.storage()
+            .persistent()
+            .set(&low_fee_key, &bypass.low_fee_count);
 
         Self::_do_release(&env, &mut escrow, &key, &caller);
     }
 
     /// Release a partial amount (one session worth) from a multi-session escrow.
     pub fn release_partial(env: Env, caller: Address, escrow_id: u64) {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("partial"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
             .persistent()
@@ -1200,21 +1769,30 @@ impl EscrowContract {
                 .safe_div(&env, escrow.total_sessions as i128)
         };
 
-        let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = amount_to_release
-            .safe_mul(&env, fee_bps as i128)
-            .safe_div(&env, 10_000);
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(&env, &escrow.mentor, amount_to_release);
         let net_amount: i128 = amount_to_release
             .safe_sub(&env, platform_fee);
 
+        let effective_bps = fee_meta
+            .map(|(_, _, ebps)| ebps)
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32));
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
-            (amount_to_release, fee_bps, platform_fee, net_amount),
+            (amount_to_release, effective_bps, platform_fee, net_amount),
         );
+
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeApplied"), escrow_id),
+                FeeAppliedEventData {
+                    mentor: escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
 
         let treasury: Address = env
             .storage()
@@ -1304,21 +1882,30 @@ impl EscrowContract {
                 .safe_mul(&env, sessions_to_release as i128)
         };
 
-        let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = amount_to_release
-            .safe_mul(&env, fee_bps as i128)
-            .safe_div(&env, 10_000);
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(&env, &escrow.mentor, amount_to_release);
         let net_amount: i128 = amount_to_release
             .safe_sub(&env, platform_fee);
 
+        let effective_bps = fee_meta
+            .map(|(_, _, ebps)| ebps)
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32));
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
-            (amount_to_release, fee_bps, platform_fee, net_amount),
+            (amount_to_release, effective_bps, platform_fee, net_amount),
         );
+
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeApplied"), escrow_id),
+                FeeAppliedEventData {
+                    mentor: escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
 
         let treasury: Address = env
             .storage()
@@ -1390,6 +1977,36 @@ impl EscrowContract {
     /// calculation) fail, the failure is counted against
     /// `MAX_FAILED_ATTEMPTS` (3).  After 3 consecutive failures the
     /// auto-release path is permanently disabled for this escrow, and the
+    /// Attempt to automatically release an escrow after the configured delay.
+    ///
+    /// Anyone can call this to trigger automatic release if the session has ended
+    /// and the configured auto-release delay has passed. The escrow transitions
+    /// to `Released` and funds are transferred to the mentor. Implements exponential
+    /// backoff for failed releases (stuck escrows) with configurable retry logic.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the escrow to attempt auto-release
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` state
+    /// - Current time must be ≥ `session_end_time + auto_release_delay`
+    /// - Escrow must not have been previously disputed or manually released
+    ///
+    /// # Errors
+    /// If the release fails (e.g., token transfer fails), the escrow may enter
+    /// backoff state. Multiple failed attempts trigger the "stuck escrow" protocol,
+    /// allowing escalation via `report_stuck_escrow` or `emergency_release`.
+    ///
+    /// # Workflow
+    /// active_escrow → (after delay) → try_auto_release → auto-released or
+    /// stuck (requiring emergency intervention or manual recovery)
+    /// Emits EscrowAutoReleased event if successful.
+    ///
+    /// # Gas Optimization
+    /// This operation is optimized for batching multiple auto-releases via
+    /// `batch_release` (admin-only). `emergency_release` (multi-sig admin bypass)
+    /// must be used to unlock the funds if this operation persistently fails.
     /// `emergency_release` (multi-sig admin bypass) must be used to unlock
     /// the funds.
     pub fn try_auto_release(env: Env, escrow_id: u64) {
@@ -1611,8 +2228,39 @@ impl EscrowContract {
         true
     }
 
-    /// Open a dispute (called by mentor or learner).
+    /// Open a dispute on an active escrow, freezing funds until resolved.
+    ///
+    /// Either party (mentor or learner) can open a dispute on an `Active` escrow.
+    /// The escrow transitions to `Disputed` state and funds remain frozen until
+    /// an authorized arbitrator calls `resolve_dispute` to split the funds based
+    /// on a percentage allocation. A reason code is recorded for auditing.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `caller`: The address opening the dispute (must be mentor or learner)
+    /// - `escrow_id`: The ID of the escrow to dispute
+    /// - `reason`: A symbol reason code (e.g., "quality_issue", "no_delivery")
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` state
+    /// - Caller must be the mentor or learner
+    /// - Escrow must not have been previously disputed, released, or refunded
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Active state
+    /// - Caller is neither the mentor nor learner
+    /// - Escrow is already disputed, released, or resolved
+    ///
+    /// # Workflow
+    /// active_escrow → dispute → frozen → resolve_dispute (split by percentage)
+    /// Emits DisputeOpened event with caller and reason.
+    ///
+    /// # Post-Dispute Resolution
+    /// Funds remain frozen until `resolve_dispute` is called by an authorized
+    /// arbitrator to allocate the escrowed amount between the parties.
     pub fn dispute(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("dispute"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
             .persistent()
@@ -1666,9 +2314,46 @@ impl EscrowContract {
     /// Admin only. Can only be called on `Disputed` escrows.
     ///
     /// - `mentor_pct`: percentage (0–100) of `escrow.amount` sent to the mentor.
+    /// Resolve a disputed escrow by splitting funds between mentor and learner.
+    ///
+    /// Admin-only operation that splits a disputed escrow's escrowed amount based
+    /// on a percentage allocation. The mentor receives `mentor_pct` percent of the
+    /// escrowed amount, and the learner receives the remainder (`100 - mentor_pct`).
+    /// No platform fee is deducted — the full escrowed amount is distributed.
+    /// Transitions escrow to `Resolved` state.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the disputed escrow to resolve
+    /// - `mentor_pct`: Percentage (0–100) of the escrowed amount to allocate to mentor
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Disputed` state
+    /// - Caller must be admin (auth required)
+    /// - `mentor_pct` must be 0–100 (inclusive)
+    /// - Escrow must not have been previously released or refunded
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Disputed state
+    /// - Caller is not the admin
+    /// - `mentor_pct` is outside 0–100 range
+    /// - Token transfer fails
+    /// - Escrow has already been resolved
+    ///
+    /// # Example Allocations
+    /// - `mentor_pct = 100` → all funds to mentor
+    /// - `mentor_pct = 50` → equal split
+    /// - `mentor_pct = 0` → all funds to learner
+    ///
+    /// # Workflow
+    /// disputed_escrow → resolve_dispute(50) → equal split to both parties
+    /// Emits DisputeResolved event with mentor percentage and amounts.
+    ///
     ///   The remainder (`100 - mentor_pct`) goes to the learner. No platform fee
     ///   is deducted — the full escrowed amount is split between the parties.
     pub fn resolve_dispute(env: Env, escrow_id: u64, mentor_pct: u32) {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("resolve"));
         // --- Admin auth ---
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
         env.storage().persistent().extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
@@ -1676,6 +2361,10 @@ impl EscrowContract {
 
         if mentor_pct > 100 {
             panic!("mentor_pct must be 0–100");
+        }
+
+        if Self::is_isolated(env.clone(), escrow_id) {
+            panic!("Escrow isolated pending manual review");
         }
 
         // --- Load escrow ---
@@ -1739,6 +2428,37 @@ impl EscrowContract {
     }
 
     /// Refund tokens to the learner (admin only).
+    ///
+    /// Refund an escrow to the learner — admin only.
+    ///
+    /// Admin-only operation that returns the entire escrowed amount to the learner.
+    /// Can only be called on `Active` or `Disputed` escrows. Once called, the escrow
+    /// transitions to `Refunded` state and cannot be released or resolved.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the escrow to refund
+    ///
+    /// # Preconditions
+    /// - Escrow must exist and be in `Active` or `Disputed` state
+    /// - Caller must be admin (auth required)
+    /// - Escrow must not have been previously released or refunded
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Escrow is not in Active or Disputed state
+    /// - Caller is not the admin
+    /// - Escrow is already released, refunded, or resolved
+    /// - Token transfer fails (insufficient funds or token error)
+    ///
+    /// # Workflow
+    /// active_escrow → refund → full amount returned to learner
+    /// Emits EscrowRefunded event with learner address and amount.
+    ///
+    /// # Use Cases
+    /// - Session cancelled before delivery
+    /// - Mentor unable to complete work (emergency refund)
+    /// - Admin-initiated reversal for policy violations
     ///
     /// Can be called on `Active` or `Disputed` escrows; panics if already
     /// `Released`, `Refunded`, or `Resolved`.
@@ -2375,7 +3095,40 @@ impl EscrowContract {
     /// Compatibility entry-point for the historical `emergency_release` name.
     ///
     /// Delegates to `execute_emergency_action` after verifying `escrow_id` /
-    /// `reason_hash` match the stored proposal. Prefer the explicit
+    /// Emergency release of an escrow by 4-of-7 multisig vote (bypass admin workflow).
+    ///
+    /// A high-security operation that allows the multisig admin group to force-release
+    /// a stuck or disputed escrow without going through the normal release/resolve workflow.
+    /// Requires explicit signatures from 4 of 7 designated signers, and the operation is
+    /// permanently recorded in immutable audit logs for regulatory compliance.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `caller`: The multisig address triggering the release
+    /// - `escrow_id`: The ID of the escrow to emergency-release
+    /// - `reason_hash`: Hash of the reason/justification for the emergency release
+    /// - `action_id`: Pre-approved action ID from `propose_emergency_action`
+    ///
+    /// # Preconditions
+    /// - Caller must be the multisig admin (auth required)
+    /// - Escrow must exist (any state)
+    /// - Action ID must have received 4-of-7 multisig approvals
+    /// - Circuit breaker limits must be respected (10% of total active pool per 24h)
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Caller is not the multisig admin
+    /// - Action hasn't been fully approved
+    /// - Circuit breaker limit exceeded
+    /// - Token transfer fails
+    ///
+    /// # Workflow
+    /// Stuck/Disputed Escrow → emergency_release (multisig) → Funds released,
+    /// immutable audit trail created
+    /// Emits EmergencyReleaseExecutedEventData with all signers and reason.
+    ///
+    /// # Security
+    /// - `reason_hash` match the stored proposal. Prefer the explicit
     /// propose → approve → execute flow.
     pub fn emergency_release(
         env: Env,
@@ -2384,6 +3137,7 @@ impl EscrowContract {
         reason_hash: BytesN<32>,
         emergency_action_id: u32,
     ) -> bool {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("emer"), caller.clone());
         let action: EmergencyAction = env
             .storage()
             .persistent()
@@ -2395,7 +3149,7 @@ impl EscrowContract {
         if action.reason_hash != reason_hash {
             panic!("Emergency action reason_hash mismatch");
         }
-        Self::execute_emergency_action(env, caller, emergency_action_id)
+        Self::execute_emergency_action(env.clone(), caller, emergency_action_id)
     }
 
     /// View: fetch an emergency action proposal.
@@ -2763,6 +3517,23 @@ impl EscrowContract {
             .get(&DataKey::MultisigAdmin)
     }
 
+    /// Retrieve an escrow by ID.
+    ///
+    /// Returns the full escrow record including mentor, learner, amount, status,
+    /// and timestamps. This is a read-only view operation.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the escrow to retrieve
+    ///
+    /// # Return Value
+    /// The `Escrow` record with all state, or panics if escrow does not exist.
+    ///
+    /// # Preconditions
+    /// - Escrow with this ID must exist
+    ///
+    /// # Errors
+    /// Panics if escrow does not exist.
     pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
@@ -2772,6 +3543,61 @@ impl EscrowContract {
             .persistent()
             .get(&key)
             .expect("Escrow not found")
+    }
+
+    pub fn monitor_escrow_invariants(env: Env, escrow_id: u64) -> EscrowInvariantReport {
+        let escrow = Self::get_escrow(env.clone(), escrow_id);
+        let released_amount = escrow.platform_fee.saturating_add(escrow.net_amount);
+        let funds_conserved = escrow.amount >= 0
+            && escrow.platform_fee >= 0
+            && escrow.net_amount >= 0
+            && released_amount <= escrow.amount;
+        let transition_consistent = escrow.sessions_completed <= escrow.total_sessions
+            && matches!(
+                escrow.status,
+                EscrowStatus::Pending
+                    | EscrowStatus::Active
+                    | EscrowStatus::Released
+                    | EscrowStatus::Disputed
+                    | EscrowStatus::Refunded
+                    | EscrowStatus::Resolved
+            );
+        let terminal_state_immutable = match escrow.status {
+            EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Resolved => {
+                !env.storage().persistent().has(&DataKey::StateTransitionLock(escrow_id))
+            }
+            _ => true,
+        };
+        let treasury_consistent = if escrow.status == EscrowStatus::Released {
+            released_amount > 0 || escrow.amount == 0
+        } else {
+            escrow.platform_fee <= escrow.amount
+        };
+        let mut violation_count = 0u32;
+        for ok in [funds_conserved, transition_consistent, terminal_state_immutable, treasury_consistent] {
+            if !ok {
+                violation_count = violation_count.saturating_add(1);
+            }
+        }
+        let report = EscrowInvariantReport {
+            escrow_id,
+            funds_conserved,
+            transition_consistent,
+            terminal_state_immutable,
+            treasury_consistent,
+            violation_count,
+            checked_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowInvariantReport(escrow_id), &report);
+        if violation_count > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "InvariantViolation")),
+                (escrow_id, violation_count),
+            );
+        }
+        report
     }
 
     /// Heuristic instruction/IO estimate for releasing `escrow_id` (the
@@ -2786,20 +3612,35 @@ impl EscrowContract {
         let key = (symbol_short!("ESCROW"), escrow_id);
         let exists = env.storage().persistent().has(&key);
 
-        // release_funds' own reads: escrow, admin, fee_bps, treasury.
+        // release_funds' own reads: escrow, admin, fee config, treasury.
+        // Fee config is either FeeBps or FeeSchedule; both count as one read
+        // plus the staking-contract tier lookup when the schedule is active.
         let mut storage_reads: u32 = 4;
         // _do_release's own write: updated escrow status/amounts.
         let storage_writes: u32 = if exists { 1 } else { 0 };
 
-        let fee_bps: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(DEFAULT_FEE_BPS);
+        let has_schedule = env.storage().persistent().has(&DataKey::FeeSchedule);
+        let effective_fee_bps: u32 = if has_schedule {
+            storage_reads += 1;
+            if env.storage().persistent().has(&DataKey::StakingContract) {
+                storage_reads += 1;
+            }
+            if let Some(schedule) = env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule) {
+                schedule.tier0_bps
+            } else {
+                DEFAULT_FEE_BPS
+            }
+        } else {
+            env.storage()
+                .persistent()
+                .get(&DataKey::FeeBps)
+                .unwrap_or(DEFAULT_FEE_BPS)
+        };
+
         // Net-amount transfer to mentor always happens; the platform-fee
         // transfer to treasury is conditional on a non-zero fee.
         let mut cross_contract_calls: u32 = 1;
-        if fee_bps > 0 {
+        if effective_fee_bps > 0 {
             cross_contract_calls += 1;
         }
 
@@ -2906,11 +3747,27 @@ impl EscrowContract {
         result
     }
 
-    pub fn get_escrows_by_status(env: Env, status: EscrowStatus) -> Vec<u64> {
+    /// Scan escrow ids `(offset, offset + limit]` (1-indexed against the
+    /// global escrow count) for ones matching `status`.
+    ///
+    /// `offset`/`limit` bound the *scan window*, not the match count: since
+    /// this filters an unindexed global range, capping only the number of
+    /// matches returned would still let a caller force a full-table scan by
+    /// asking for a status with few (or zero) hits. Capping the scan window
+    /// itself (to at most `MAX_PAGE_SIZE`, #831) is what actually bounds
+    /// the work this call can do. A caller wanting every match pages
+    /// through by repeatedly advancing `offset` by the count it scanned
+    /// (`min(limit, MAX_PAGE_SIZE)`) until it has covered `get_escrow_count()`.
+    pub fn get_escrows_by_status(env: Env, status: EscrowStatus, offset: u32, limit: u32) -> Vec<u64> {
         let count: u64 = env.storage().persistent().get(&DataKey::EscrowCount).unwrap_or(0u64);
         let mut result = Vec::new(&env);
 
-        for i in 1..=count {
+        let count_u32 = count.min(u32::MAX as u64) as u32;
+        let (start, end) = Pagination::new(offset, limit).bounds(count_u32);
+
+        // Escrow ids are 1-indexed; `start`/`end` are 0-indexed offsets
+        // into the id space [1, count].
+        for i in (start as u64 + 1)..=(end as u64) {
             let key = (symbol_short!("ESCROW"), i);
             if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
                 if escrow.status == status {
@@ -3072,6 +3929,34 @@ impl EscrowContract {
     // Milestone escrow functions
     // -----------------------------------------------------------------------
 
+    /// Create a milestone-based escrow with multiple staged payments.
+    ///
+    /// Similar to `create_escrow` but splits the total into multiple milestones,
+    /// each with its own deliverable description hash and payment amount.
+    /// The learner funds the entire escrow upfront, but funds are released milestone
+    /// by milestone as each is completed and approved.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `mentor`: The mentor address
+    /// - `learner`: The learner address and funder
+    /// - `total_amount`: Total gross amount across all milestones
+    /// - `milestones`: Vector of `MilestoneSpec` (description_hash, amount pairs)
+    /// - `token_address`: The token contract address
+    /// - `session_end_time`: Unix timestamp for session completion
+    ///
+    /// # Preconditions
+    /// - Token must be approved
+    /// - Sum of milestone amounts must equal `total_amount`
+    /// - Each milestone must have a valid description hash
+    /// - Learner must have sufficient balance
+    ///
+    /// # Errors
+    /// Panics if milestone amounts don't sum to total_amount or token is not approved.
+    ///
+    /// # Workflow
+    /// create_milestone_escrow → complete_milestone(0) → ... → complete_milestone(n)
+    /// Funds are released progressively as each milestone is completed.
     pub fn create_milestone_escrow(
         env: Env,
         mentor: Address,
@@ -3162,6 +4047,31 @@ impl EscrowContract {
         count
     }
 
+    /// Mark a milestone as completed and release its funds to the mentor.
+    ///
+    /// Only the learner can call this to mark a milestone as completed after
+    /// the mentor has delivered on that milestone's deliverable. Once marked
+    /// complete, the milestone's allocated amount is transferred to the mentor
+    /// and the milestone transitions to `Completed` state.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the milestone escrow
+    /// - `milestone_index`: The zero-indexed milestone to complete
+    ///
+    /// # Preconditions
+    /// - Escrow must be a milestone-based escrow
+    /// - Milestone must be in `Pending` status
+    /// - Caller must be the learner
+    /// - Escrow must be in `Active` status
+    ///
+    /// # Errors
+    /// Panics if milestone is already completed, disputed, or escrow is not active.
+    ///
+    /// # Workflow
+    /// Milestone Pending → complete_milestone → Completed (funds transferred)
+    /// Multiple milestones can be completed in sequence, or one can be disputed
+    /// to freeze the entire escrow and trigger arbitration.
     pub fn complete_milestone(env: Env, escrow_id: u64, milestone_index: u32) {
         let key = (symbol_short!("MESCROW"), escrow_id);
         env.storage()
@@ -3193,25 +4103,33 @@ impl EscrowContract {
         milestone_escrow.learner.require_auth();
 
         let milestone = milestone_escrow.milestones.get(milestone_index).unwrap();
-        let fee_bps: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = milestone
-            .amount
-            .safe_mul(&env, fee_bps as i128)
-            .safe_div(&env, 10_000);
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(
+            &env,
+            &milestone_escrow.mentor,
+            milestone.amount,
+        );
         let net_amount: i128 = milestone.amount.safe_sub(&env, platform_fee);
 
+        let effective_bps = fee_meta
+            .map(|(_, _, ebps)| ebps)
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32));
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
-            (milestone.amount, fee_bps, platform_fee, net_amount),
+            (milestone.amount, effective_bps, platform_fee, net_amount),
         );
+
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeApplied"), escrow_id),
+                FeeAppliedEventData {
+                    mentor: milestone_escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
 
         let treasury: Address = env
             .storage()
@@ -3260,6 +4178,32 @@ impl EscrowContract {
         );
     }
 
+    /// Dispute a specific milestone in a milestone-based escrow.
+    ///
+    /// Either party can dispute a single milestone, which transitions the entire
+    /// escrow to `Disputed` state. This freezes all remaining funds and requires
+    /// arbitrator intervention to resolve. The specific milestone is marked as
+    /// `Disputed` and a reason code is recorded.
+    ///
+    /// # Parameters
+    /// - `env`: The contract environment
+    /// - `escrow_id`: The ID of the milestone escrow
+    /// - `milestone_index`: The zero-indexed milestone to dispute
+    /// - `reason`: Symbol reason code for the dispute
+    ///
+    /// # Preconditions
+    /// - Escrow must be a milestone-based escrow
+    /// - Milestone must be in `Pending` status
+    /// - Caller must be the mentor or learner
+    /// - Escrow must be in `Active` status
+    ///
+    /// # Errors
+    /// Panics if milestone is already completed/disputed or escrow is not active.
+    ///
+    /// # Workflow
+    /// Active → dispute_milestone → Disputed (escrow frozen, awaiting arbitration)
+    /// The entire escrow enters dispute flow; `resolve_dispute` will split the
+    /// escrowed amount between both parties based on the arbitrator's decision.
     pub fn dispute_milestone(env: Env, escrow_id: u64, milestone_index: u32, reason: Symbol) {
         let key = (symbol_short!("MESCROW"), escrow_id);
         env.storage()
@@ -3333,35 +4277,7 @@ impl EscrowContract {
     fn _do_release(env: &Env, escrow: &mut Escrow, key: &(Symbol, u64), actor: &Address) {
         let release_amount = escrow.amount;
 
-        // Prefer the graduated fee schedule (Issue #676) when configured;
-        // otherwise fall back to the flat FeeBps rate for backward compat.
-        let platform_fee: i128;
-        let mut fee_meta: Option<(u32, u32, u32)> = None; // (tier, base_bps, effective_bps)
-        if let Some(schedule) = env
-            .storage()
-            .persistent()
-            .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
-        {
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-            let (fee, tier, base_bps, effective_bps) =
-                Self::_compute_fee_with_meta(env, &schedule, &escrow.mentor, release_amount);
-            platform_fee = fee;
-            fee_meta = Some((tier, base_bps, effective_bps));
-        } else {
-            let fee_bps: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::FeeBps)
-                .unwrap_or(DEFAULT_FEE_BPS);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-            platform_fee = release_amount
-                .safe_mul(&env, fee_bps as i128)
-                .safe_div(&env, 10_000);
-        }
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(env, &escrow.mentor, release_amount);
 
         let net_amount: i128 = release_amount
             .safe_sub(&env, platform_fee);
@@ -3460,6 +4376,39 @@ impl EscrowContract {
             .persistent()
             .get::<_, bool>(&key)
             .unwrap_or(false)
+    }
+
+    /// Require `caller` to be the contract admin for an escrow-scoped admin
+    /// operation, with contextual panic messages and a structured error
+    /// event on failure (#988). Replaces the repeated
+    /// `.expect("Not initialized")` / bare `panic!("Unauthorized")` pair
+    /// that gave no indication of which operation or escrow failed.
+    fn _require_admin_for_escrow(env: &Env, caller: &Address, escrow_id: u64, operation: &str) {
+        let stored_admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        let stored_admin = match stored_admin {
+            Some(a) => a,
+            None => {
+                log_contract_error(
+                    env,
+                    Symbol::new(env, operation),
+                    Symbol::new(env, "not_init"),
+                    escrow_id as i128,
+                    None,
+                );
+                panic!("{}: escrow contract not initialized (no admin set)", operation);
+            }
+        };
+        caller.require_auth();
+        if *caller != stored_admin {
+            log_contract_error(
+                env,
+                Symbol::new(env, operation),
+                Symbol::new(env, "unauthorized"),
+                escrow_id as i128,
+                Some(caller.clone()),
+            );
+            panic!("{}: caller is not the admin for escrow {}", operation, escrow_id);
+        }
     }
 
     /// Shared escrow creation logic with strict token whitelist validation.
@@ -4487,6 +5436,185 @@ impl EscrowContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    // -----------------------------------------------------------------------
+    // Payment-integrity & escrow-gaming protection (#886)
+    // -----------------------------------------------------------------------
+
+    /// Open a dispute with an explicit evidence commitment, recording the
+    /// action for payment-timing manipulation analysis. This is the
+    /// evidence-aware counterpart to `dispute` — callers that want the
+    /// stronger `resolve_dispute_secure` path should open disputes here so
+    /// the timing log is populated from the start.
+    pub fn dispute_payment(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
+        Self::dispute(env.clone(), caller, escrow_id, reason);
+        Self::_log_dispute_action(&env, escrow_id);
+    }
+
+    /// Record an approval toward the multi-signature threshold required to
+    /// resolve a disputed escrow via `resolve_dispute_secure`. Any address
+    /// may submit an approval; only distinct approvers count toward the
+    /// threshold.
+    pub fn approve_dispute_resolution(env: Env, approver: Address, escrow_id: u64) -> EscrowMultisigApproval {
+        approver.require_auth();
+        let key = DataKey::ResolutionApprovals(escrow_id);
+        let mut approvers: Vec<Address> = env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        if !approvers.contains(approver.clone()) {
+            approvers.push_back(approver);
+        }
+        env.storage().persistent().set(&key, &approvers);
+        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        check_multisig_threshold(&env, &approvers)
+    }
+
+    /// Record the number of evidence items on file for a disputed escrow
+    /// (mirrored from the dispute-evidence contract by the admin) so that
+    /// `resolve_dispute_secure` can validate evidence sufficiency on-chain.
+    pub fn record_evidence_count(env: Env, admin: Address, escrow_id: u64, evidence_count: u32) {
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "record_evidence_count");
+        env.storage().persistent().set(&DataKey::DisputeEvidenceCount(escrow_id), &evidence_count);
+    }
+
+    /// Resolve a disputed escrow with the enhanced anti-gaming safeguards:
+    /// requires sufficient evidence and an elapsed cooldown since the
+    /// dispute was opened (payment-timing manipulation prevention), plus a
+    /// multi-signature threshold of distinct approvals (escrow security).
+    ///
+    /// Falls back to the same split logic as `resolve_dispute`.
+    pub fn resolve_dispute_secure(env: Env, admin: Address, escrow_id: u64, mentor_pct: u32) {
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "resolve_dispute_secure");
+
+        if Self::is_isolated(env.clone(), escrow_id) {
+            panic!("Escrow isolated pending manual review");
+        }
+
+        let opened_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeActionLog(escrow_id))
+            .map(|log: Vec<u64>| log.get(0).unwrap_or(0))
+            .unwrap_or(0);
+        let evidence_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCount(escrow_id))
+            .unwrap_or(0);
+        let evidence: EvidenceSufficiency = validate_evidence_sufficiency(&env, evidence_count, opened_at);
+        if !evidence.sufficient {
+            panic!("Insufficient evidence or cooldown not elapsed");
+        }
+
+        let approvers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ResolutionApprovals(escrow_id))
+            .unwrap_or(Vec::new(&env));
+        let approval = check_multisig_threshold(&env, &approvers);
+        if !approval.threshold_met {
+            panic!("Multi-signature approval threshold not met");
+        }
+
+        Self::_log_dispute_action(&env, escrow_id);
+        Self::resolve_dispute(env.clone(), escrow_id, mentor_pct);
+
+        let mut audit = Self::get_payment_audit(env.clone(), escrow_id);
+        audit.resolved_at = env.ledger().timestamp();
+        audit.evidence_count = evidence_count;
+        env.storage().persistent().set(&DataKey::PaymentAudit(escrow_id), &audit);
+    }
+
+    /// Isolate an escrow's funds when a payment-manipulation attack is
+    /// detected (e.g. rapid dispute/approval cycling). Isolated escrows
+    /// cannot be released or resolved until an admin calls
+    /// `recover_isolated_escrow`. Callable by the admin directly for a
+    /// known incident, or by automation after `assess_payment_manipulation_risk`
+    /// reports a suspected attack.
+    pub fn emergency_isolate_escrow(env: Env, admin: Address, escrow_id: u64, reason: Symbol) -> EmergencyFundLock {
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "emergency_isolate_escrow");
+
+        let lock = EmergencyFundLock {
+            isolate: true,
+            reason: reason.clone(),
+            locked_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::IsolatedEscrow(escrow_id), &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Isolated"), escrow_id),
+            (reason, lock.locked_at),
+        );
+
+        let mut audit = Self::get_payment_audit(env.clone(), escrow_id);
+        audit.isolated = true;
+        env.storage().persistent().set(&DataKey::PaymentAudit(escrow_id), &audit);
+
+        lock
+    }
+
+    /// Assess whether an escrow's dispute-action history shows signs of
+    /// payment-timing manipulation (e.g. rapid-fire dispute/approval
+    /// cycling), without mutating isolation state. Automation can use this
+    /// read-only check to decide whether to call `emergency_isolate_escrow`.
+    pub fn assess_payment_manipulation_risk(env: Env, escrow_id: u64) -> PaymentTimingCheck {
+        let log: Vec<u64> = env.storage().persistent().get(&DataKey::DisputeActionLog(escrow_id)).unwrap_or(Vec::new(&env));
+        detect_payment_timing_manipulation(&log)
+    }
+
+    /// Lift emergency isolation on an escrow after manual admin review,
+    /// allowing normal release/resolution flows to resume.
+    pub fn recover_isolated_escrow(env: Env, admin: Address, escrow_id: u64) {
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "recover_isolated_escrow");
+        env.storage().persistent().set(&DataKey::IsolatedEscrow(escrow_id), &false);
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Recovered"), escrow_id),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Whether an escrow's funds are currently isolated.
+    pub fn is_isolated(env: Env, escrow_id: u64) -> bool {
+        env.storage().persistent().get(&DataKey::IsolatedEscrow(escrow_id)).unwrap_or(false)
+    }
+
+    /// Return the payment-audit trail for a given escrow.
+    pub fn get_payment_audit(env: Env, escrow_id: u64) -> PaymentAuditEntry {
+        env.storage().persistent().get(&DataKey::PaymentAudit(escrow_id)).unwrap_or(PaymentAuditEntry {
+            escrow_id,
+            dispute_opened_at: 0,
+            evidence_count: 0,
+            resolved_at: 0,
+            isolated: false,
+        })
+    }
+
+    /// Internal: append the current ledger timestamp to an escrow's
+    /// dispute-action log (capped at 20 entries) for timing-manipulation
+    /// analysis, initializing the payment-audit record on first use.
+    fn _log_dispute_action(env: &Env, escrow_id: u64) {
+        let key = DataKey::DisputeActionLog(escrow_id);
+        let mut log: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+        let now = env.ledger().timestamp();
+        let first_action = log.is_empty();
+        log.push_back(now);
+        while log.len() > 20 {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        if first_action {
+            env.storage().persistent().set(
+                &DataKey::PaymentAudit(escrow_id),
+                &PaymentAuditEntry {
+                    escrow_id,
+                    dispute_opened_at: now,
+                    evidence_count: 0,
+                    resolved_at: 0,
+                    isolated: false,
+                },
+            );
+        }
+    }
 }
 
 fn transition_status(
@@ -4856,37 +5984,192 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
-    // Dynamic fee tests
+    // Dynamic fee tests (legacy flat tiers)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_dynamic_fee_price_below_10_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(500_000);
+        let fee = EscrowContract::_legacy_fee_from_price(500_000);
         assert_eq!(fee, 500);
     }
 
     #[test]
     fn test_dynamic_fee_price_10_to_50_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(3_000_000);
+        let fee = EscrowContract::_legacy_fee_from_price(3_000_000);
         assert_eq!(fee, 400);
     }
 
     #[test]
     fn test_dynamic_fee_price_50_to_100_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(7_500_000);
+        let fee = EscrowContract::_legacy_fee_from_price(7_500_000);
         assert_eq!(fee, 300);
     }
 
     #[test]
     fn test_dynamic_fee_price_above_100_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(15_000_000);
+        let fee = EscrowContract::_legacy_fee_from_price(15_000_000);
         assert_eq!(fee, 200);
     }
 
     #[test]
     fn test_dynamic_fee_fallback_when_price_zero() {
-        let fee = EscrowContract::_calculate_fee_from_price(0);
+        let fee = EscrowContract::_legacy_fee_from_price(0);
         assert_eq!(fee, 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // Graduated price-multiplier tests (FeeSchedule integration)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_price_multiplier_low_price_penalizes() {
+        let mult = EscrowContract::_price_multiplier_bps(500_000); // < $0.10
+        assert_eq!(mult, 12_500); // 125% of base tier rate
+    }
+
+    #[test]
+    fn test_price_multiplier_mid_low_slight_penalty() {
+        let mult = EscrowContract::_price_multiplier_bps(3_000_000); // $0.10-$0.50
+        assert_eq!(mult, 11_000); // 110%
+    }
+
+    #[test]
+    fn test_price_multiplier_mid_high_neutral() {
+        let mult = EscrowContract::_price_multiplier_bps(7_500_000); // $0.50-$1.00
+        assert_eq!(mult, 10_000); // 100% (no change)
+    }
+
+    #[test]
+    fn test_price_multiplier_high_price_discounts() {
+        let mult = EscrowContract::_price_multiplier_bps(15_000_000); // > $1.00
+        assert_eq!(mult, 9_000); // 90% of base tier rate
+    }
+
+    #[test]
+    fn test_price_multiplier_zero_price_is_neutral() {
+        let mult = EscrowContract::_price_multiplier_bps(0);
+        assert_eq!(mult, 10_000); // no penalty when price unavailable
+    }
+
+    #[test]
+    fn test_tier_bps_maps_correctly() {
+        let schedule = FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 1_000_000,
+            volume_discount_bps: 50,
+        };
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 0), 500);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 1), 400);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 2), 300);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 3), 200);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 99), 500); // unknown → tier0
+    }
+
+    #[test]
+    fn test_volume_discount_applies_when_threshold_exceeded() {
+        let schedule = FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 10_000,
+            volume_discount_bps: 50,
+        };
+        // Below threshold: no discount applied
+        assert_eq!(
+            EscrowContract::_compute_fee_with_meta_no_dynamic(
+                &schedule, 0, 5_000,
+            ),
+            (250, 0, 500, 500)
+        );
+        // Above threshold: 50 bps discount
+        assert_eq!(
+            EscrowContract::_compute_fee_with_meta_no_dynamic(
+                &schedule, 0, 20_000,
+            ),
+            (900, 0, 500, 450)
+        );
+    }
+
+    #[test]
+    fn test_volume_discount_saturates_at_zero() {
+        let schedule = FeeSchedule {
+            tier0_bps: 100,
+            tier1_bps: 100,
+            tier2_bps: 100,
+            tier3_bps: 100,
+            volume_discount_threshold: 10_000,
+            volume_discount_bps: 500, // larger than base 100
+        };
+        // saturating_sub ensures we never go below 0 bps effective rate
+        let (fee, _, _, effective) =
+            EscrowContract::_compute_fee_with_meta_no_dynamic(&schedule, 0, 50_000);
+        assert_eq!(effective, 0);
+        assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_rejects_over_cap_tiers() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bad = FeeSchedule {
+                tier0_bps: 1_001, // > MAX_FEE_BPS (1000)
+                tier1_bps: 400,
+                tier2_bps: 300,
+                tier3_bps: 200,
+                volume_discount_threshold: 0,
+                volume_discount_bps: 0,
+            };
+            EscrowContract::_validate_fee_schedule(&bad);
+        }));
+        assert!(result.is_err(), "tier0 over cap should panic");
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_rejects_negative_threshold() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bad = FeeSchedule {
+                tier0_bps: 500,
+                tier1_bps: 400,
+                tier2_bps: 300,
+                tier3_bps: 200,
+                volume_discount_threshold: -1,
+                volume_discount_bps: 0,
+            };
+            EscrowContract::_validate_fee_schedule(&bad);
+        }));
+        assert!(result.is_err(), "negative threshold should panic");
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_rejects_excessive_discount_bps() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bad = FeeSchedule {
+                tier0_bps: 500,
+                tier1_bps: 400,
+                tier2_bps: 300,
+                tier3_bps: 200,
+                volume_discount_threshold: 0,
+                volume_discount_bps: 1_001, // > MAX_FEE_BPS
+            };
+            EscrowContract::_validate_fee_schedule(&bad);
+        }));
+        assert!(result.is_err(), "volume discount over cap should panic");
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_accepts_valid_schedule() {
+        let good = FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 1_000_000,
+            volume_discount_bps: 50,
+        };
+        EscrowContract::_validate_fee_schedule(&good); // must not panic
     }
 
     // -----------------------------------------------------------------------
@@ -5733,5 +7016,65 @@ mod test {
         f.client().refund(&id);
         assert_eq!(count_standard_escrow_events(&f, "refunded"), 1);
     }
-}
 
+    // -----------------------------------------------------------------------
+    // Payment-integrity & escrow-gaming protection (#886)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_dispute_secure_requires_evidence_and_cooldown() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().dispute_payment(&f.learner, &id, &symbol_short!("NO_SHOW"));
+
+        let approver1 = Address::generate(&f.env);
+        let approver2 = Address::generate(&f.env);
+        f.client().approve_dispute_resolution(&approver1, &id);
+        f.client().approve_dispute_resolution(&approver2, &id);
+
+        // No evidence recorded yet and cooldown hasn't elapsed -> must panic.
+        let result = f.client().try_resolve_dispute_secure(&f.admin, &id, &50u32);
+        assert!(result.is_err());
+
+        f.client().record_evidence_count(&f.admin, &id, &1u32);
+        advance_time(&f.env, 24 * 3_600 + 1);
+
+        f.client().resolve_dispute_secure(&f.admin, &id, &50u32);
+        let audit = f.client().get_payment_audit(&id);
+        assert_eq!(audit.evidence_count, 1);
+        assert!(audit.resolved_at > 0);
+    }
+
+    #[test]
+    fn test_resolve_dispute_secure_requires_multisig_threshold() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().dispute_payment(&f.learner, &id, &symbol_short!("NO_SHOW"));
+        f.client().record_evidence_count(&f.admin, &id, &1u32);
+        advance_time(&f.env, 24 * 3_600 + 1);
+
+        // Only one approver — threshold (2) not met.
+        let approver1 = Address::generate(&f.env);
+        f.client().approve_dispute_resolution(&approver1, &id);
+
+        let result = f.client().try_resolve_dispute_secure(&f.admin, &id, &50u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_isolate_blocks_release_and_can_be_recovered() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+
+        f.client().emergency_isolate_escrow(&f.admin, &id, &Symbol::new(&f.env, "attack"));
+        assert!(f.client().is_isolated(&id));
+
+        let result = f.client().try_release_funds(&f.learner, &id);
+        assert!(result.is_err());
+
+        f.client().recover_isolated_escrow(&f.admin, &id);
+        assert!(!f.client().is_isolated(&id));
+
+        f.client().release_funds(&f.learner, &id);
+    }
+}

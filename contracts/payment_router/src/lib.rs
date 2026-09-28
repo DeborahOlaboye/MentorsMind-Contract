@@ -1,9 +1,22 @@
 #![no_std]
 
+use shared::mev_protection::{detect_atomic_arbitrage, enforce_protocol_isolation};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Val, Vec,
+    contract, contractimpl, contracterror, contracttype, symbol_short, token, Address, BytesN, Env,
+    IntoVal, Symbol, Val, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Cross-chain MEV / atomic arbitrage detected — route rejected.
+    MevProtection = 1,
+}
 
 // Source chain constants
 pub const CHAIN_STELLAR: u32 = 0;
@@ -75,6 +88,8 @@ pub enum DataKey {
     Timelock,
     Multisig,
     SupportedChains,
+    /// Per-caller interaction counter for MEV detection, keyed by (caller, ledger sequence).
+    MevInteractionCount(Address, u32),
 }
 
 // TTL constants (in ledgers; ~5 s/ledger → 1 000 000 ≈ 57 days)
@@ -165,6 +180,21 @@ impl PaymentRouter {
     }
 
     // -----------------------------------------------------------------------
+    // MEV Protection helpers
+    // -----------------------------------------------------------------------
+
+    /// Track how many times `caller` has interacted in the current ledger
+    /// sequence and return that count.  Stored in temporary storage so it
+    /// expires automatically after the ledger closes.
+    fn _track_mev_interaction(env: &Env, caller: &Address) -> u32 {
+        let key = DataKey::MevInteractionCount(caller.clone(), env.ledger().sequence());
+        let mut count: u32 = env.storage().temporary().get(&key).unwrap_or(0);
+        count += 1;
+        env.storage().temporary().set(&key, &count);
+        count
+    }
+
+    // -----------------------------------------------------------------------
     // Payment Routing
     // -----------------------------------------------------------------------
 
@@ -195,6 +225,14 @@ impl PaymentRouter {
         // circumvent restrictions in the escrow contract.
         if !Self::_is_token_approved(&env, &token) {
             panic!("Token not approved for routing");
+        }
+
+        // MEV protection: detect atomic arbitrage across chains and enforce
+        // protocol isolation before any further routing logic runs.
+        let interactions = Self::_track_mev_interaction(&env, &learner);
+        let mev_flag = detect_atomic_arbitrage(&env, &learner, interactions);
+        if !enforce_protocol_isolation(&mev_flag) {
+            panic!("MEV protection: atomic arbitrage detected — route rejected");
         }
 
         // Verify the source transaction
@@ -1373,6 +1411,63 @@ mod test {
             &learner,
             &mentor,
             &1000,
+            &fixture.token_client.address,
+        );
+    }
+
+    // =========================================================================
+    // MEV Protection Tests
+    // =========================================================================
+
+    /// A learner that routes 5 payments in the same ledger sequence triggers
+    /// the atomic-arbitrage detector (risk_score = 90 ≥ threshold of 75) and
+    /// the 6th attempt must be rejected with the MEV protection panic.
+    ///
+    /// detect_atomic_arbitrage thresholds (shared::mev_protection):
+    ///   interactions >= 3  → is_arbitrage = true  (+50 risk)
+    ///   interactions >= 5  → is_sandwich  = true  (+40 risk)
+    ///   total risk = 90 ≥ MEV_ARBITRAGE_RISK_THRESHOLD (75) → blocked
+    #[test]
+    #[should_panic(expected = "MEV protection: atomic arbitrage detected")]
+    fn test_mev_protection_fires_for_suspicious_routing_pattern() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Fund the learner generously so balance is never the blocker.
+        fixture.fund_learner(&learner, 100_000);
+
+        // Route 5 payments in the SAME ledger sequence.  Each call increments
+        // the per-(caller, sequence) interaction counter.  After 5 calls the
+        // counter reaches 5, making is_sandwich = true and risk_score = 90.
+        // The 6th call therefore hits enforce_protocol_isolation → false.
+        for i in 0u8..5 {
+            // Each hash must be unique to avoid the "already routed" guard.
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0] = i + 0xA0;
+            let tx_hash = BytesN::from_array(&fixture.env, &hash_bytes);
+
+            fixture.router_client.route_payment(
+                &CHAIN_STELLAR,
+                &tx_hash,
+                &learner,
+                &mentor,
+                &100,
+                &fixture.token_client.address,
+            );
+        }
+
+        // The 6th attempt: interaction count reaches 6, sandwich flag still
+        // true, risk_score = 90 — MEV protection must fire here.
+        let mut final_hash = [0u8; 32];
+        final_hash[0] = 0xFF;
+        let tx_hash_final = BytesN::from_array(&fixture.env, &final_hash);
+        fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash_final,
+            &learner,
+            &mentor,
+            &100,
             &fixture.token_client.address,
         );
     }

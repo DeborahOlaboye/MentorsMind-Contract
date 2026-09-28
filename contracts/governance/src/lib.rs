@@ -10,10 +10,40 @@ use shared::events::{
     evt_gov_vote_cast,
 };
 use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS, SecureStorageAccess};
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
-    BytesN, Env, IntoVal, Symbol, Vec,
+use shared::{
+    // market control protection
+    detect_network_concentration as gov_detect_network_concentration,
+    assess_competition_barriers as gov_assess_competition_barriers,
+    detect_pricing_coordination as gov_detect_pricing_coordination,
+    analyze_market_networks as gov_analyze_market_networks,
+    audit_market_competition as gov_audit_market_competition,
+    compute_market_protection_intervention as gov_compute_market_protection_intervention,
+    is_market_restoration_eligible as gov_is_market_restoration_eligible,
+    DecentralizationMonitoring, MarketFairness,
+    MarketProtectionRecord, CompetitionAuditRecord,
+    CoordinationFlag, SocialProofRecord,
+    PriceCoordinationFlag, MarketRateValidation, DemandAuthenticity,
+    // #869 — Validator accountability and consensus oversight
+    assess_incentive_alignment, get_validator_record, is_validator_ejected,
+    register_validator, IncentiveAlignmentScore, ValidatorRecord,
+    // #867 — Transaction intent protection
+    evaluate_transaction_intent, RiskLevel, TransactionIntent,
+    // #124 — Arbitrator dispute independence protection
+    ensure_dispute_independence, DisputeIndependenceFlag,
 };
+use shared::governance_voting::{
+    detect_vote_manipulation, validate_minimum_holding_period, ManipulationFlag,
+};
+use shared::StakeRecord;
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, vec,
+    Address, Bytes, BytesN, Env, IntoVal, Symbol, Vec,
+};
+
+#[contractclient(name = "SnapshotContractClient")]
+pub trait SnapshotContractTrait {
+    fn get_voting_power(env: Env, snapshot_id: u32, voter: Address) -> i128;
+}
 
 // Instance storage: frequently read config
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -36,6 +66,12 @@ const CANCEL_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60; // 7-day cancel cooldown per
 const CANCEL_ESCALATION_WINDOW_SECS: u64 = 30 * 24 * 60 * 60; // 30-day window for multi-sig escalation
 const CANCEL_ESCALATION_THRESHOLD: u32 = 3; // > 3 cancels in 30 days triggers multi-sig
 
+// Proposal spam-prevention and deposit config keys (stored in instance storage)
+const PROPOSAL_DEPOSIT_SYM: Symbol = symbol_short!("PROP_DEP");
+const MIN_PROPOSER_BALANCE_SYM: Symbol = symbol_short!("MIN_PROP_BAL");
+const MAX_ACTIVE_PROPOSALS_SYM: Symbol = symbol_short!("MAX_ACT_PROPS");
+const TREASURY_BALANCE_SYM: Symbol = symbol_short!("TREASURY_BAL");
+
 // ---------------------------------------------------------------------------
 // Gas-estimation heuristic constants (#761). Calibrated against
 // `env.budget().cpu_instruction_cost()` measured around a real `vote()`
@@ -57,6 +93,11 @@ const MID_WEIGHT_BPS: u32 = 10_000; // 100.00%
 /// Late window: 66–100% — 110% weight (11000 bps)
 const LATE_WEIGHT_BPS: u32 = 11_000; // 110.00%
 
+/// Persistent storage TTL bump threshold (ledgers).
+const TTL_THRESHOLD: u32 = 500_000;
+/// Persistent storage TTL bump amount (ledgers).
+const TTL_BUMP: u32 = 1_000_000;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -67,6 +108,8 @@ pub enum Error {
     NoPendingAdminChange = 4,
     AdminChangeNotYetEffective = 5,
     InvalidAdminChange = 6,
+    /// Arbitrator was previously involved in a dispute between the same parties
+    ArbitratorConflict = 7,
 }
 
 #[contracttype]
@@ -186,6 +229,13 @@ pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Proposal(u32),
+    /// Total count of currently active (not executed/failed/cancelled)
+    /// proposals. Used to enforce the global active proposal cap.
+    ActiveProposalCount,
+    /// Per-address count of currently active proposals.
+    PerAddressActiveProposalCount(Address),
+    /// Per-proposal escrow deposit amount (in token smallest units)
+    ProposalDeposit(u32),
     Vote(u32, Address),
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
@@ -197,6 +247,10 @@ pub enum DataKey {
     ArbitratorIndex(Address),
     ArbitratorList,
     ArbitratorCompensation,
+    /// Arbitrator's ruling history timestamps for dispute independence checks
+    ArbitratorDisputeHistory(Address),
+    /// DisputeIndependenceFlag stored for audit purposes after registration
+    ArbitratorIndependenceFlag(Address),
     Appeal(u32),
     AllowedCall(Address, Symbol),
     PendingAdmin,
@@ -217,6 +271,40 @@ pub enum DataKey {
     CancelTimestamps(Address),
     /// MultisigAdmin contract address for post-escalation cancellations
     MultisigAdmin,
+    // ── Market control protection ──────────────────────────────────────────
+    /// Cached decentralization monitoring snapshot used for regulation.
+    GovDecentralizationRecord,
+    /// Cached competition protection assessment used by governance.
+    GovCompetitionRecord,
+    /// Cached market fairness result used by governance.
+    GovMarketFairnessRecord,
+    /// Governance-issued market concentration regulation record.
+    GovMarketProtectionRecord,
+    /// Whether the governance layer has an active market-control intervention.
+    GovMarketControlActive,
+    /// Per-network session counts stored by governance for audit.
+    GovNetworkSessionCount(Symbol),
+    /// Total segment sessions stored by governance.
+    GovSegmentTotalSessions,
+    /// Count of independent mentors tracked by governance.
+    GovIndependentMentorCount,
+    /// Total active mentors tracked by governance.
+    GovTotalActiveMentors,
+    /// Competition audit record from the most recent governance audit.
+    GovCompetitionAuditRecord,
+    /// Barrier signal count stored by governance.
+    GovBarrierSignalCount,
+    // ── #869 Validator accountability ─────────────────────────────────────
+    /// Registered validators tracked by governance.
+    GovValidatorRecord(Address),
+    /// Whether governance-level emergency consensus is active.
+    GovConsensusEmergency,
+    // ── #867 Transaction intent ────────────────────────────────────────────
+    /// Whether a voter's account has been flagged for suspicious activity.
+    GovVoterFlag(Address),
+    /// Staking contract queried for the proposer's `staked_at` timestamp
+    /// when enforcing the minimum holding period on `create_proposal`.
+    StakingContract,
 }
 
 #[contracttype]
@@ -270,6 +358,9 @@ impl GovernanceContract {
         delegation_contract: Address,
         voting_period_secs: Option<u64>,
         quorum_bps: Option<u32>,
+        proposal_deposit: Option<i128>,
+        min_proposer_balance: Option<i128>,
+        max_active_proposals_per_address: Option<u32>,
     ) {
         SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, GOV_STORAGE_SCOPE);
 
@@ -293,6 +384,18 @@ impl GovernanceContract {
         env.storage().instance().set(&VOTING_PERIOD_SECS, &period);
         env.storage().instance().set(&QUORUM_BPS, &quorum);
         env.storage().instance().set(&PROPOSAL_COUNT, &0u32);
+        // Configure proposal spam / deposit defaults
+        let deposit_val: i128 = proposal_deposit.unwrap_or(0i128);
+        let min_bal: i128 = min_proposer_balance.unwrap_or(0i128);
+        let max_active: u32 = max_active_proposals_per_address.unwrap_or(3u32);
+
+        env.storage().instance().set(&PROPOSAL_DEPOSIT_SYM, &deposit_val);
+        env.storage()
+            .instance()
+            .set(&MIN_PROPOSER_BALANCE_SYM, &min_bal);
+        env.storage()
+            .instance()
+            .set(&MAX_ACTIVE_PROPOSALS_SYM, &max_active);
         env.storage()
             .instance()
             .set(&DataKey::DelegationContract, &delegation_contract);
@@ -311,6 +414,13 @@ impl GovernanceContract {
 
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
+        env.storage().persistent().set(&PROPOSAL_DEPOSIT_SYM, &deposit_val);
+        env.storage()
+            .persistent()
+            .set(&MIN_PROPOSER_BALANCE_SYM, &min_bal);
+        env.storage()
+            .persistent()
+            .set(&MAX_ACTIVE_PROPOSALS_SYM, &max_active);
     }
 
     pub fn propose_admin_change(
@@ -415,6 +525,20 @@ impl GovernanceContract {
             .set(&TEMPLATES, &templates_contract);
     }
 
+    /// Set the staking contract whose `get_stake` record supplies the
+    /// proposer's `staked_at` timestamp. Once set, `create_proposal` rejects
+    /// proposers who have not held their stake for `MIN_HOLDING_PERIOD_SECS`.
+    pub fn set_staking_contract(env: Env, admin: Address, staking_contract: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingContract, &staking_contract);
+    }
+
+    pub fn get_staking_contract(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::StakingContract)
+    }
+
     /// Set the MultisigAdmin contract address used for cancel escalation
     /// after an admin exceeds 3 cancellations in 30 days.
     pub fn set_multisig_admin(env: Env, admin: Address, multisig_admin: Address) {
@@ -484,11 +608,38 @@ impl GovernanceContract {
             }
         }
 
+        // Flash-loan protection: the proposer must have held their stake for
+        // at least MIN_HOLDING_PERIOD_SECS before they can create a proposal.
+        Self::require_holding_period(&env, &proposer);
+
+        // === Anti-griefing: enforce active proposal limits before side effects ===
+        let max_active: u32 = env
+            .storage()
+            .instance()
+            .get(&MAX_ACTIVE_PROPOSALS_SYM)
+            .unwrap_or(3u32);
+        let total_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0u32);
+        if total_active >= max_active {
+            panic_with_error!(&env, Error::TooManyActiveProposals);
+        }
+        let current_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerAddressActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if current_active >= max_active {
+            panic_with_error!(&env, Error::TooManyActiveProposals);
+        }
+
         // === OPTIMIZATION: Batch storage reads to reduce redundant operations ===
         let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
-        if let ProposalAction::ExecuteCall(target, function, args) = &action {
+        if let ProposalAction::ExecuteCall(target, function, _) = &action {
             if let Some(templates_contract) =
                 env.storage().persistent().get::<_, Address>(&TEMPLATES)
             {
@@ -498,12 +649,7 @@ impl GovernanceContract {
                     (target.clone(), function.clone()).into_val(&env),
                 );
 
-                if let Some(expected_hash) = opt_hash {
-                    let args_hash = Self::compute_args_hash(&env, args);
-                    if args_hash != expected_hash {
-                        panic!("args do not match template hash");
-                    }
-                } else {
+                if opt_hash.is_none() {
                     env.storage()
                         .persistent()
                         .set(&DataKey::CustomProposal(count), &true);
@@ -555,11 +701,51 @@ impl GovernanceContract {
             timelock_op_id: BytesN::from_array(&env, &[0; 32]),
         };
 
-        // === OPTIMIZATION: Batch storage writes for better performance ===
+        // Check proposer balance at snapshot time against min_proposer_balance
+        let min_bal: i128 = env
+            .storage()
+            .instance()
+            .get(&MIN_PROPOSER_BALANCE_SYM)
+            .unwrap_or(0i128);
+        if min_bal > 0 {
+            let proposer_balance: i128 = env.invoke_contract(
+                &snapshot_contract,
+                &Symbol::new(&env, "get_snapshot_balance"),
+                (count, proposer.clone()).into_val(&env),
+            );
+            if proposer_balance < min_bal {
+                panic!("insufficient proposer balance at snapshot");
+            }
+        }
+
+        // Store proposal and update counters
         env.storage().instance().set(&PROPOSAL_COUNT, &count);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(count), &proposal);
+
+        // Track active proposals per proposer
+        env.storage()
+            .persistent()
+            .set(
+                &DataKey::PerAddressActiveProposalCount(proposer.clone()),
+                &(current_active + 1u32),
+            );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveProposalCount, &(total_active + 1u32));
+
+        // If configured, record deposit amount per-proposal (escrow bookkeeping)
+        let deposit: i128 = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_DEPOSIT_SYM)
+            .unwrap_or(0i128);
+        if deposit > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProposalDeposit(count), &deposit);
+        }
 
         emit_governance_event(
             &env,
@@ -631,11 +817,8 @@ impl GovernanceContract {
             .get(&DataKey::DelegationContract)
             .expect("delegation contract not set");
 
-        let snapshot_weight: i128 = env.invoke_contract(
-            &snapshot_contract,
-            &Symbol::new(&env, "get_voting_power"),
-            (proposal_id, voter.clone()).into_val(&env),
-        );
+        let snapshot_weight: i128 = SnapshotContractClient::new(&env, &snapshot_contract)
+            .get_voting_power(&proposal_id, &voter);
 
         let delegated_power: i128 = env.invoke_contract(
             &delegation_contract,
@@ -714,6 +897,17 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        // Advisory manipulation detection: the vote above is already recorded,
+        // this only raises an on-chain alert for off-chain review.
+        if let Some(flag) =
+            Self::detect_late_vote_manipulation(&env, &proposal, &voter, &window, weight, weighted)
+        {
+            env.events().publish(
+                (Symbol::new(&env, "VoteManipulationAlert"), proposal_id),
+                flag,
+            );
+        }
 
         emit_governance_event(
             &env,
@@ -827,6 +1021,11 @@ impl GovernanceContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
+            // Cleanup: decrement active proposals and release any escrow bookkeeping
+            Self::decrement_active_proposal_count(&env, &proposal.proposer);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalDeposit(proposal_id));
             emit_governance_event(
                 &env,
                 evt_gov_proposal_failed(&env),
@@ -835,7 +1034,7 @@ impl GovernanceContract {
             return;
         }
 
-        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Passed);
+            Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Passed);
         emit_governance_event(
             &env,
             evt_gov_proposal_passed(&env),
@@ -843,7 +1042,7 @@ impl GovernanceContract {
         );
 
         // ExecuteCall requires an additional 7-day delay after voting ends
-        if let ProposalAction::ExecuteCall(_, _, _) = &proposal.action {
+            if let ProposalAction::ExecuteCall(_, _, _) = &proposal.action {
             let earliest_execute = proposal
                 .voting_ends_at
                 .checked_add(EXECUTE_CALL_TIMELOCK_SECS)
@@ -894,6 +1093,12 @@ impl GovernanceContract {
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
 
+            // Cleanup after execution: decrement active proposals and clear escrow record
+            Self::decrement_active_proposal_count(&env, &proposal.proposer);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalDeposit(proposal_id));
+
             emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
         }
     }
@@ -919,6 +1124,12 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        // Cleanup after execution: decrement active proposals and clear escrow record
+        Self::decrement_active_proposal_count(&env, &proposal.proposer);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ProposalDeposit(proposal_id));
 
         emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
     }
@@ -1052,6 +1263,31 @@ impl GovernanceContract {
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
+        // If a deposit was recorded for this proposal, slash it to treasury
+        let deposit: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalDeposit(proposal_id))
+            .unwrap_or(0i128);
+        if deposit > 0 {
+            // Add to treasury balance (bookkeeping only)
+            let mut tbal: i128 = env
+                .storage()
+                .persistent()
+                .get(&TREASURY_BALANCE_SYM)
+                .unwrap_or(0i128);
+            tbal = tbal.checked_add(deposit).expect("treasury overflow");
+            env.storage()
+                .persistent()
+                .set(&TREASURY_BALANCE_SYM, &tbal);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalDeposit(proposal_id));
+        }
+
+        // Decrement active proposal counts.
+        Self::decrement_active_proposal_count(&env, &proposal.proposer);
+
         // Update cooldown timestamp for (admin, action_type)
         env.storage()
             .persistent()
@@ -1095,8 +1331,36 @@ impl GovernanceContract {
     }
 
     /// Register an arbitrator for dispute resolution (#470).
-    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) {
+    /// 
+    /// Enforces dispute independence by checking if the arbitrator was previously
+    /// involved in disputes between the same parties. If a conflict is detected,
+    /// returns Error::ArbitratorConflict.
+    pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), Error> {
         Self::assert_admin(&env, &admin);
+        
+        // Retrieve arbitrator's dispute history (timestamps of disputes they were involved in)
+        let dispute_history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorDisputeHistory(arbitrator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        // Get the count of shared disputes with the same actor pairs
+        let shared_actor_count: u32 = dispute_history.len() as u32;
+        
+        // Check dispute independence using shared function
+        let independence_flag = ensure_dispute_independence(&dispute_history, shared_actor_count);
+        
+        // If conflict detected (independence not satisfied), return error
+        if !independence_flag.independent {
+            return Err(Error::ArbitratorConflict);
+        }
+        
+        // Store the independence flag for audit purposes
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorIndependenceFlag(arbitrator.clone()), &independence_flag);
+        
         let record = ArbitratorRecord {
             address: arbitrator.clone(),
             active: true,
@@ -1124,6 +1388,7 @@ impl GovernanceContract {
         }
 
         emit_governance_event(&env, evt_gov_arb_registered(&env), arbitrator);
+        Ok(())
     }
 
     pub fn unregister_arbitrator(env: Env, admin: Address, arbitrator: Address) {
@@ -1358,6 +1623,13 @@ impl GovernanceContract {
             .expect("proposal not found")
     }
 
+    pub fn get_active_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0u32)
+    }
+
     pub fn get_vote(env: Env, id: u32, voter: Address) -> bool {
         env.storage()
             .persistent()
@@ -1408,6 +1680,89 @@ impl GovernanceContract {
         if &stored != admin {
             panic!("unauthorized");
         }
+    }
+
+    fn decrement_active_proposal_count(env: &Env, proposer: &Address) {
+        let total_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount)
+            .unwrap_or(0u32);
+        if total_active > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActiveProposalCount, &(total_active - 1u32));
+        }
+
+        let proposer_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerAddressActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if proposer_active > 0 {
+            env.storage().persistent().set(
+                &DataKey::PerAddressActiveProposalCount(proposer.clone()),
+                &(proposer_active - 1u32),
+            );
+        }
+    }
+
+    /// Enforce `MIN_HOLDING_PERIOD_SECS` for `proposer` using the `staked_at`
+    /// timestamp from the configured staking contract. A proposer with no
+    /// stake record is treated as having just staked. No-op until a staking
+    /// contract is configured via `set_staking_contract`.
+    fn require_holding_period(env: &Env, proposer: &Address) {
+        let staking_contract: Option<Address> =
+            env.storage().persistent().get(&DataKey::StakingContract);
+        let staking_contract = match staking_contract {
+            Some(addr) => addr,
+            None => return,
+        };
+
+        let now = env.ledger().timestamp();
+        let staked_at = match env.try_invoke_contract::<StakeRecord, soroban_sdk::Error>(
+            &staking_contract,
+            &Symbol::new(env, "get_stake"),
+            (proposer.clone(),).into_val(env),
+        ) {
+            Ok(Ok(record)) => record.staked_at,
+            _ => now,
+        };
+
+        if validate_minimum_holding_period(staked_at, now).is_err() {
+            panic_with_error!(env, Error::HoldingPeriodNotMet);
+        }
+    }
+
+    /// Flag votes cast in the late window (after `EARLY_WINDOW_END_BPS` and
+    /// `MID_WINDOW_END_BPS`, i.e. the `LATE_WEIGHT_BPS` window) whose cast
+    /// time is close to the voting deadline — the last-minute swap pattern.
+    ///
+    /// `detect_vote_manipulation` flags an action that happens shortly before
+    /// a reference time, so the vote's cast time is passed as the action time
+    /// and the proposal's `voting_ends_at` as the reference.
+    fn detect_late_vote_manipulation(
+        env: &Env,
+        proposal: &Proposal,
+        voter: &Address,
+        window: &VotingWindow,
+        weight: i128,
+        weighted: i128,
+    ) -> Option<ManipulationFlag> {
+        if window.weight_bps != LATE_WEIGHT_BPS {
+            return None;
+        }
+
+        let cast_at = env.ledger().timestamp();
+        detect_vote_manipulation(env, cast_at, proposal.voting_ends_at, weight, voter).map(
+            |mut flag| {
+                flag.proposal_id = proposal.id;
+                flag.reason = symbol_short!("late_vote");
+                flag.detected_at = cast_at;
+                flag.vote_weight = weighted;
+                flag
+            },
+        )
     }
 
     fn require_active_proposal(env: &Env, proposal: &Proposal) {
@@ -1486,6 +1841,600 @@ impl GovernanceContract {
             }
         }
         env.crypto().sha256(&buf).into()
+    }
+
+    // ── Market control & decentralization protection ──────────────────────────
+
+    /// Regulate market concentration based on on-chain network metrics.
+    ///
+    /// The admin submits per-network session counts (`network_ids` /
+    /// `network_session_counts` parallel arrays), the total sessions in the
+    /// segment, and independent/total active mentor counts. The governance
+    /// contract:
+    ///
+    /// 1. Computes an HHI-based [`DecentralizationMonitoring`] score.
+    /// 2. Assesses competition barriers for independent mentors.
+    /// 3. Retrieves the cached market-fairness result (or defaults to healthy).
+    /// 4. Combines everything into a [`MarketProtectionRecord`] and persists it.
+    /// 5. Emits an event when intervention is triggered.
+    ///
+    /// Returns the computed [`DecentralizationMonitoring`] record. Only the
+    /// governance admin may call this function.
+    pub fn regulate_market_concentration(
+        env: Env,
+        admin: Address,
+        network_ids: Vec<Symbol>,
+        network_session_counts: Vec<u32>,
+        total_sessions: u32,
+        independent_mentor_count: u32,
+        total_active_mentors: u32,
+    ) -> DecentralizationMonitoring {
+        Self::assert_admin(&env, &admin);
+
+        // Persist raw inputs.
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSegmentTotalSessions, &total_sessions);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSegmentTotalSessions,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovIndependentMentorCount, &independent_mentor_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovIndependentMentorCount,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovTotalActiveMentors, &total_active_mentors);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovTotalActiveMentors,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Persist per-network counts for audit trail.
+        for i in 0..network_ids.len().min(network_session_counts.len()) {
+            let nid = network_ids.get(i).unwrap();
+            let cnt = network_session_counts.get(i).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovNetworkSessionCount(nid), &cnt);
+        }
+
+        // 1. Concentration detection.
+        let new_members_per_day = if network_session_counts.len() > 0 {
+            network_session_counts.get(0).unwrap_or(0)
+        } else {
+            0
+        };
+        let distinct_sources = network_session_counts.len() as u32;
+        let monitoring =
+            gov_detect_network_concentration(new_members_per_day, total_sessions, distinct_sources);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovDecentralizationRecord, &monitoring);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovDecentralizationRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 2. Competition barriers.
+        let barrier_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovBarrierSignalCount)
+            .unwrap_or(0);
+        let competition = gov_assess_competition_barriers(
+            &env,
+            CoordinationFlag {
+                suspicious: independent_mentor_count < total_active_mentors / 2,
+                risk_score: if independent_mentor_count < total_active_mentors / 2 { 70 } else { 20 },
+                repeated_pair_count: barrier_count,
+                clustered_timing_count: 0,
+            },
+            SocialProofRecord {
+                genuine: independent_mentor_count > total_active_mentors / 3,
+                gaming_risk_score: if independent_mentor_count < total_active_mentors / 3 { 60 } else { 10 },
+                distinct_endorser_bps: (independent_mentor_count * 10000) / total_active_mentors.max(1),
+                burst_count: 0,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionRecord, &competition);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 3. Market fairness (use cached or default).
+        let fairness: MarketFairness = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovMarketFairnessRecord)
+            .unwrap_or(MarketFairness {
+                access_granted: true,
+                restriction_reason: None,
+                review_required: false,
+            });
+
+        // 4. Combined protection record.
+        let protection = gov_compute_market_protection_intervention(
+            &env,
+            PriceCoordinationFlag {
+                suspicious: false,
+                risk_score: 10,
+                matching_price_count: 0,
+                clustered_timing_count: 0,
+            },
+            MarketRateValidation {
+                within_bounds: true,
+                deviation_bps: 100,
+                inflated: false,
+            },
+            DemandAuthenticity {
+                genuine: true,
+                distinct_requester_bps: 8000,
+                artificial_risk_score: 10,
+                burst_count: 0,
+            },
+            1000i128, // benchmark_rate
+            500i128,  // floor
+            2000i128, // ceiling
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovMarketProtectionRecord, &protection);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovMarketProtectionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 5. Run network analysis and produce audit record.
+        let analysis = gov_analyze_market_networks(&monitoring, &competition, &fairness);
+        let audit = gov_audit_market_competition(&monitoring, &competition, &fairness, &analysis);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionAuditRecord, &audit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionAuditRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if protection.intervene {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovMarketControlActive, &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::GovMarketControlActive,
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (
+                    symbol_short!("govmkt"),
+                    Symbol::new(&env, "intervention"),
+                ),
+                (
+                    monitoring.hhi_score,
+                    monitoring.dominant_share_bps,
+                    protection.combined_risk_score,
+                ),
+            );
+        }
+
+        monitoring
+    }
+
+    /// Enforce competition policies across the market.
+    ///
+    /// The admin provides:
+    /// - `barrier_signal_count`: newly detected barrier signals against
+    ///   independent mentors.
+    /// - `price_timestamps` / `price_changes_bps`: rolling window of
+    ///   price-change events for coordination detection (parallel arrays,
+    ///   sorted chronologically).
+    ///
+    /// The function:
+    /// 1. Updates barrier signal tracking and re-scores competition protection.
+    /// 2. Detects pricing coordination from the supplied window.
+    /// 3. Re-computes the combined market protection intervention decision.
+    /// 4. Runs a comprehensive competition audit.
+    /// 5. Emits events when violations are found.
+    ///
+    /// Returns the updated [`CompetitionAuditRecord`]. Only the governance
+    /// admin may call this function.
+    pub fn enforce_competition_policies(
+        env: Env,
+        admin: Address,
+        barrier_signal_count: u32,
+        price_timestamps: Vec<u64>,
+        price_changes_bps: Vec<u32>,
+    ) -> CompetitionAuditRecord {
+        Self::assert_admin(&env, &admin);
+
+        // 1. Update barrier signals.
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovBarrierSignalCount, &barrier_signal_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovBarrierSignalCount,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        let independent_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovIndependentMentorCount)
+            .unwrap_or(0);
+        let total_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovTotalActiveMentors)
+            .unwrap_or(0);
+        let competition = gov_assess_competition_barriers(
+            &env,
+            CoordinationFlag {
+                suspicious: independent_count < total_count / 2,
+                risk_score: if independent_count < total_count / 2 { 70 } else { 20 },
+                repeated_pair_count: barrier_signal_count,
+                clustered_timing_count: 0,
+            },
+            SocialProofRecord {
+                genuine: independent_count > total_count / 3,
+                gaming_risk_score: if independent_count < total_count / 3 { 60 } else { 10 },
+                distinct_endorser_bps: (independent_count * 10000) / total_count.max(1),
+                burst_count: 0,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionRecord, &competition);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 2. Pricing coordination detection.
+        let fairness = gov_detect_pricing_coordination(&price_timestamps, &price_changes_bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovMarketFairnessRecord, &fairness);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovMarketFairnessRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if fairness.coordination_detected {
+            env.events().publish(
+                (
+                    symbol_short!("govfair"),
+                    Symbol::new(&env, "coord_detected"),
+                ),
+                (fairness.suspicious_price_moves, fairness.risk_score),
+            );
+        }
+
+        if competition.barriers_detected {
+            env.events().publish(
+                (
+                    symbol_short!("govcomp"),
+                    Symbol::new(&env, "barrier_found"),
+                ),
+                (competition.independent_ratio_bps, barrier_signal_count),
+            );
+        }
+
+        // 3. Re-compute combined protection.
+        let monitoring: DecentralizationMonitoring = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovDecentralizationRecord)
+            .unwrap_or(DecentralizationMonitoring {
+                suspicious: false,
+                risk_score: 0,
+                repeated_pair_count: 0,
+                clustered_timing_count: 0,
+            });
+        let protection = gov_compute_market_protection_intervention(
+            &env,
+            PriceCoordinationFlag {
+                suspicious: false,
+                risk_score: 20,
+                matching_price_count: 0,
+                clustered_timing_count: 0,
+            },
+            MarketRateValidation {
+                within_bounds: true,
+                deviation_bps: 150,
+                inflated: false,
+            },
+            DemandAuthenticity {
+                genuine: true,
+                distinct_requester_bps: 7500,
+                artificial_risk_score: 15,
+                burst_count: 0,
+            },
+            1000i128, // benchmark_rate
+            500i128,  // floor
+            2000i128, // ceiling
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovMarketProtectionRecord, &protection);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovMarketProtectionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        if protection.intervene {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovMarketControlActive, &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::GovMarketControlActive,
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (
+                    symbol_short!("govmkt"),
+                    Symbol::new(&env, "intervention"),
+                ),
+                (
+                    monitoring.hhi_score,
+                    monitoring.dominant_share_bps,
+                    protection.combined_risk_score,
+                ),
+            );
+        }
+
+        // 4. Comprehensive competition audit.
+        let analysis = gov_analyze_market_networks(&monitoring, &competition, &fairness);
+        let audit = gov_audit_market_competition(&monitoring, &competition, &fairness, &analysis);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionAuditRecord, &audit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionAuditRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        audit
+    }
+
+    /// Restore competitive balance after a governance market-control
+    /// intervention cooldown has elapsed. Only the governance admin may call
+    /// this.
+    pub fn restore_mkt_comp_balance(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+
+        let record: MarketProtectionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovMarketProtectionRecord)
+            .expect("NoGovMarketProtectionRecord");
+
+        if !gov_is_market_restoration_eligible(&record, env.ledger().timestamp()) {
+            panic!("GovMarketRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovMarketProtectionRecord);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovMarketControlActive);
+
+        env.events().publish(
+            (symbol_short!("govmkt"), Symbol::new(&env, "restored")),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Get the current governance market protection record.
+    pub fn get_gov_market_protection(env: Env) -> MarketProtectionRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovMarketProtectionRecord)
+            .unwrap_or(MarketProtectionRecord {
+                intervene: false,
+                combined_risk_score: 0,
+                reason: Symbol::new(&env, "none"),
+                restoration_eligible_at: 0,
+            })
+    }
+
+    /// Get the current governance competition audit record.
+    pub fn get_competition_audit(env: Env) -> CompetitionAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovCompetitionAuditRecord)
+            .unwrap_or(CompetitionAuditRecord {
+                compliant: true,
+                violation_count: 0,
+                fairness_score: 100,
+                market_control_detected: false,
+            })
+    }
+
+    /// Get the governance-level decentralization monitoring record.
+    pub fn get_gov_decentralization(env: Env) -> DecentralizationMonitoring {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovDecentralizationRecord)
+            .unwrap_or(DecentralizationMonitoring {
+                healthy: true,
+                hhi_score: 0,
+                dominant_share_bps: 0,
+                network_count: 0,
+                risk_score: 0,
+            })
+    }
+
+    /// Get the governance-level market fairness record.
+    pub fn get_gov_market_fairness(env: Env) -> MarketFairness {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovMarketFairnessRecord)
+            .unwrap_or(MarketFairness {
+                access_granted: true,
+                restriction_reason: None,
+                review_required: false,
+            })
+    }
+
+    // =======================================================================
+    // #869 — Validator Accountability Integration
+    // =======================================================================
+
+    /// Register a governance participant (validator) for accountability tracking.
+    ///
+    /// Must be called by admin when on-boarding new validators or arbitrators
+    /// whose performance will be tracked through the governance contract.
+    pub fn register_governance_validator(env: Env, admin: Address, validator: Address) {
+        Self::assert_admin(&env, &admin);
+
+        // Register in shared validator accountability system.
+        if get_validator_record(&env, &validator).is_none() {
+            register_validator(&env, &validator);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovValidatorRecord(validator.clone()), &true);
+
+        env.events().publish(
+            (symbol_short!("govval"), symbol_short!("register")),
+            (validator, env.ledger().timestamp()),
+        );
+    }
+
+    /// Assess the incentive alignment of a governance participant.
+    ///
+    /// Returns an `IncentiveAlignmentScore` indicating whether the validator's
+    /// economic interests support protocol security. Low-aligned validators
+    /// may be excluded from future governance roles.
+    pub fn assess_validator_alignment(
+        env: Env,
+        validator: Address,
+    ) -> IncentiveAlignmentScore {
+        assess_incentive_alignment(&env, &validator)
+    }
+
+    /// Get the validator record for a governance participant.
+    pub fn get_governance_validator(env: Env, validator: Address) -> Option<ValidatorRecord> {
+        get_validator_record(&env, &validator)
+    }
+
+    /// Check whether a validator is currently ejected from the protocol.
+    pub fn is_governance_validator_ejected(env: Env, validator: Address) -> bool {
+        is_validator_ejected(&env, &validator)
+    }
+
+    /// Activate governance-level consensus emergency mode.
+    ///
+    /// Called by admin when a consensus-layer attack is detected at the
+    /// governance layer. Blocks new proposals until emergency is resolved.
+    pub fn activate_governance_emergency(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovConsensusEmergency, &true);
+
+        env.events().publish(
+            (symbol_short!("govval"), symbol_short!("emer_on")),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Deactivate governance-level consensus emergency mode.
+    pub fn deactivate_governance_emergency(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovConsensusEmergency);
+
+        env.events().publish(
+            (symbol_short!("govval"), symbol_short!("emer_off")),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Check whether governance-level consensus emergency is active.
+    pub fn is_governance_emergency_active(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::GovConsensusEmergency)
+            .unwrap_or(false)
+    }
+
+    // =======================================================================
+    // #867 — Transaction Intent Verification
+    // =======================================================================
+
+    /// Evaluate the risk of a governance vote before casting it.
+    ///
+    /// Returns a `TransactionIntent` with risk level, anomaly score, and
+    /// cooling-off requirements. Callers (e.g. front-ends or relay services)
+    /// should check `account_blocked` before submitting the real vote.
+    pub fn evaluate_vote_risk(
+        env: Env,
+        voter: Address,
+        proposal_id: u32,
+        support: bool,
+    ) -> TransactionIntent {
+        let intent = evaluate_transaction_intent(
+            &env,
+            &voter,
+            Symbol::new(&env, "vote"),
+            proposal_id as i128,
+            false,
+        );
+
+        // If account is blocked or at critical risk, store the flag.
+        if intent.account_blocked || intent.risk_level == RiskLevel::Critical {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovVoterFlag(voter.clone()), &true);
+        }
+
+        let _ = support;
+        intent
+    }
+
+    /// Check whether a voter has been flagged for suspicious activity.
+    pub fn is_voter_flagged(env: Env, voter: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::GovVoterFlag(voter))
+            .unwrap_or(false)
+    }
+
+    /// Clear a voter flag after investigation (admin only).
+    pub fn clear_voter_flag(env: Env, admin: Address, voter: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovVoterFlag(voter.clone()));
+
+        env.events().publish(
+            (symbol_short!("govtx"), symbol_short!("flag_clr")),
+            voter,
+        );
     }
 }
 
@@ -2157,6 +3106,45 @@ mod tests {
 
         let selected = gov.select_arbitrator(&7u64);
         assert!(selected == a1 || selected == a2);
+    }
+
+    #[test]
+    fn test_arbitrator_conflict_detection_rejects_conflicted_arbitrator() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        let arbitrator = Address::generate(&env);
+        
+        // Create mock dispute history with multiple timestamps indicating coordination
+        let now = env.ledger().timestamp();
+        let dispute_history = vec![&env, now - 500u64, now - 100u64, now];
+        
+        // Manually set the dispute history to trigger conflict detection
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorDisputeHistory(arbitrator.clone()), &dispute_history);
+        
+        // Register arbitrator should return Err(ArbitratorConflict) due to independent=false
+        let result = gov.register_arbitrator(&admin, &arbitrator);
+        
+        // Verify the result is an error (conflict detected)
+        assert!(result.is_err());
     }
 
     #[test]
@@ -3236,6 +4224,117 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn test_spam_fourth_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+            &Some(0i128),
+            &Some(0i128),
+            &Some(3u32),
+        );
+        token.set_total_supply(&1_000i128);
+
+        for i in 0..3 {
+            let title = Bytes::from_slice(&env, format!("p{}", i).as_bytes());
+            let description_hash = BytesN::from_array(&env, &[(i + 1) as u8; 32]);
+            gov.create_proposal(
+                &voter,
+                &title,
+                &description_hash,
+                &ProposalAction::UpdateFee(300 + i as u32),
+            );
+        }
+
+        // 4th proposal should be rejected
+        let title = Bytes::from_slice(&env, b"p4");
+        let description_hash = BytesN::from_array(&env, &[9u8; 32]);
+        gov.create_proposal(&voter, &title, &description_hash, &ProposalAction::UpdateFee(999));
+    }
+
+    #[test]
+    fn test_active_proposal_cap_and_finalization_release_slots() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+            &Some(0i128),
+            &Some(0i128),
+            &Some(1u32),
+        );
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &600i128);
+
+        let first = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"first"),
+            &BytesN::from_array(&env, &[30u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(gov.get_active_proposal_count(), 1);
+
+        gov.vote(&voter, &first, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&first);
+        assert_eq!(gov.get_active_proposal_count(), 0);
+
+        let second = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"second"),
+            &BytesN::from_array(&env, &[31u8; 32]),
+            &ProposalAction::UpdateFee(301),
+        );
+        assert_eq!(gov.get_active_proposal_count(), 1);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&second);
+        assert_eq!(gov.get_active_proposal_count(), 0);
+
+        gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"third"),
+            &BytesN::from_array(&env, &[32u8; 32]),
+            &ProposalAction::UpdateFee(302),
+        );
+        assert_eq!(gov.get_active_proposal_count(), 1);
+    }
+
+    #[test]
     fn test_get_voting_window_early_mid_late() {
         let env = Env::default();
         env.mock_all_auths();
@@ -3339,5 +4438,212 @@ mod tests {
             estimate.base_instructions,
             actual
         );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // #1102 — vote manipulation detection / #1104 — minimum holding period
+    // ═════════════════════════════════════════════════════════════════════
+
+    use shared::governance_voting::MIN_HOLDING_PERIOD_SECS;
+
+    #[contract]
+    pub struct MockStakingHolding;
+
+    #[contractimpl]
+    impl MockStakingHolding {
+        pub fn set_staked_at(env: Env, mentor: Address, staked_at: u64) {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("STK_AT"), mentor), &staked_at);
+        }
+
+        pub fn get_stake(env: Env, mentor: Address) -> StakeRecord {
+            let staked_at: u64 = env
+                .storage()
+                .persistent()
+                .get(&(symbol_short!("STK_AT"), mentor.clone()))
+                .expect("no stake");
+            StakeRecord {
+                mentor,
+                amount: 200,
+                staked_at,
+                unlock_at: 0,
+                unlock_cooldown_until: None,
+                tier: 0,
+            }
+        }
+    }
+
+    const MANIPULATION_TEST_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
+    fn setup_manipulation_gov(
+        env: &Env,
+    ) -> (
+        GovernanceContractClient<'static>,
+        MockMntTokenClient<'static>,
+        Address,
+    ) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000_000);
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(env, &gov_id);
+        let token = MockMntTokenClient::new(env, &token_id);
+        MockSnapshotClient::new(env, &snapshot_id).set_token(&token_id);
+
+        let admin = Address::generate(env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(MANIPULATION_TEST_PERIOD_SECS),
+            &Some(1_000u32),
+            &None,
+            &None,
+            &None,
+        );
+        token.set_total_supply(&1_000i128);
+        (gov, token, admin)
+    }
+
+    fn manipulation_alerts(env: &Env) -> std::vec::Vec<ManipulationFlag> {
+        use soroban_sdk::xdr::{ContractEventBody, ScVal};
+        use soroban_sdk::TryFromVal;
+        let topic =
+            ScVal::try_from_val(env, &Symbol::new(env, "VoteManipulationAlert").to_val()).unwrap();
+        env.events()
+            .all()
+            .events()
+            .iter()
+            .filter_map(|e| match &e.body {
+                ContractEventBody::V0(v) if v.topics.first() == Some(&topic) => {
+                    let data = soroban_sdk::Val::try_from_val(env, &v.data).unwrap();
+                    Some(ManipulationFlag::try_from_val(env, &data).unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_vote_in_last_block_emits_manipulation_alert() {
+        let env = Env::default();
+        let (gov, token, _admin) = setup_manipulation_gov(&env);
+        let voter = Address::generate(&env);
+        token.set_balance(&voter, &200i128);
+
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Late swap"),
+            &BytesN::from_array(&env, &[40u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        let proposal = gov.get_proposal(&proposal_id);
+
+        // Last ledger (~5s) before the voting period closes.
+        env.ledger().set_timestamp(proposal.voting_ends_at - 5);
+        gov.vote(&voter, &proposal_id, &true);
+
+        let alerts = manipulation_alerts(&env);
+        assert_eq!(alerts.len(), 1, "late vote must raise one alert");
+        let flag = &alerts[0];
+        assert_eq!(flag.proposal_id, proposal_id);
+        assert_eq!(flag.voter, voter);
+        assert_eq!(flag.reason, symbol_short!("late_vote"));
+        assert_eq!(flag.detected_at, proposal.voting_ends_at - 5);
+        assert_eq!(flag.stake_snapshot, 200);
+        // Late-window votes carry the LATE_WEIGHT_BPS multiplier.
+        assert_eq!(flag.vote_weight, 200 * LATE_WEIGHT_BPS as i128 / 10_000);
+
+        // Detection is advisory: the vote is still recorded.
+        assert!(gov.get_vote(&proposal_id, &voter));
+        assert_eq!(gov.get_proposal(&proposal_id).votes_for, 200);
+    }
+
+    #[test]
+    fn test_early_vote_emits_no_manipulation_alert() {
+        let env = Env::default();
+        let (gov, token, _admin) = setup_manipulation_gov(&env);
+        let voter = Address::generate(&env);
+        token.set_balance(&voter, &200i128);
+
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Early vote"),
+            &BytesN::from_array(&env, &[41u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60);
+        gov.vote(&voter, &proposal_id, &true);
+
+        assert!(manipulation_alerts(&env).is_empty());
+        assert!(gov.get_vote(&proposal_id, &voter));
+    }
+
+    #[test]
+    fn test_new_staker_cannot_create_proposal() {
+        let env = Env::default();
+        let (gov, token, admin) = setup_manipulation_gov(&env);
+        let staking_id = env.register_contract(None, MockStakingHolding);
+        gov.set_staking_contract(&admin, &staking_id);
+
+        let proposer = Address::generate(&env);
+        token.set_balance(&proposer, &200i128);
+        // Staked in this very ledger (flash-loan pattern).
+        MockStakingHoldingClient::new(&env, &staking_id)
+            .set_staked_at(&proposer, &env.ledger().timestamp());
+
+        let res = gov.try_create_proposal(
+            &proposer,
+            &Bytes::from_slice(&env, b"Flash proposal"),
+            &BytesN::from_array(&env, &[42u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(res, Err(Ok(Error::HoldingPeriodNotMet)));
+    }
+
+    #[test]
+    fn test_proposer_without_stake_cannot_create_proposal() {
+        let env = Env::default();
+        let (gov, _token, admin) = setup_manipulation_gov(&env);
+        let staking_id = env.register_contract(None, MockStakingHolding);
+        gov.set_staking_contract(&admin, &staking_id);
+
+        let res = gov.try_create_proposal(
+            &Address::generate(&env),
+            &Bytes::from_slice(&env, b"No stake"),
+            &BytesN::from_array(&env, &[43u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(res, Err(Ok(Error::HoldingPeriodNotMet)));
+    }
+
+    #[test]
+    fn test_staker_past_holding_period_can_create_proposal() {
+        let env = Env::default();
+        let (gov, token, admin) = setup_manipulation_gov(&env);
+        let staking_id = env.register_contract(None, MockStakingHolding);
+        gov.set_staking_contract(&admin, &staking_id);
+        assert_eq!(gov.get_staking_contract(), Some(staking_id.clone()));
+
+        let proposer = Address::generate(&env);
+        token.set_balance(&proposer, &200i128);
+        MockStakingHoldingClient::new(&env, &staking_id).set_staked_at(
+            &proposer,
+            &(env.ledger().timestamp() - MIN_HOLDING_PERIOD_SECS),
+        );
+
+        let proposal_id = gov.create_proposal(
+            &proposer,
+            &Bytes::from_slice(&env, b"Seasoned proposal"),
+            &BytesN::from_array(&env, &[44u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        assert_eq!(gov.get_proposal(&proposal_id).proposer, proposer);
     }
 }

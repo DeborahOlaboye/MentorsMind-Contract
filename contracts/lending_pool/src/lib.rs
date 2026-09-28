@@ -19,8 +19,11 @@ pub trait CreditScoreContractTrait {
 
 use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
-    key_interest_rate_bps, key_min_credit_score,
-    DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_CREDIT_SCORE,
+    key_cooldown_days, key_interest_rate_bps, key_min_bond, key_min_credit_score,
+    key_platform_fee_bps, key_sub_expiry_grace, key_tier_bronze, key_tier_gold,
+    key_tier_silver, DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
+    DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE,
+    DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,6 +60,9 @@ pub enum DataKey {
     RateModelSlope2Bps,        // slope2 above kink in bps
     /// Minimum credit score required to borrow (defaults to MIN_CREDIT_SCORE).
     MinCreditScore,
+    RegulatoryReporting,
+    LiquidationAuction(Address),
+    BadDebt,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +205,7 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::RateModelSlope2Bps, &DEFAULT_SLOPE2_BPS);
         
         // Initialize regulatory reporting with placeholder
-        env.storage().instance().set(&DataKey::RegulatoryReporting, &Address::generate(&env));
+        env.storage().instance().set(&DataKey::RegulatoryReporting, &admin);
 
         init_protocol_params(&env, &rbac_contract);
         Ok(())
@@ -238,7 +244,7 @@ impl LendingPool {
             .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
         {
             use soroban_sdk::IntoVal;
-            let _ = env.try_invoke_contract::<(), _>(
+            let _ = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
                 &reporting_addr,
                 &Symbol::new(env, "record_large_tx"),
                 (
@@ -342,7 +348,7 @@ impl LendingPool {
         env.storage()
             .instance()
             .get(&DataKey::MinCreditScore)
-            .unwrap_or(MIN_CREDIT_SCORE)
+            .unwrap_or(DEFAULT_MIN_CREDIT_SCORE as u32)
     }
 
     /// Get current interest rate based on pool utilization
@@ -527,6 +533,7 @@ impl LendingPool {
 
         lender.require_auth();
 
+        let deposit_ledger_key = DataKey::LenderDepositLedger(lender.clone());
         let deposit_ledger: u32 = env
             .storage()
             .persistent()
@@ -627,7 +634,7 @@ impl LendingPool {
             .storage()
             .instance()
             .get(&DataKey::MinCreditScore)
-            .unwrap_or(MIN_CREDIT_SCORE);
+            .unwrap_or(DEFAULT_MIN_CREDIT_SCORE as u32);
         let credit_score = CreditScoreClient::new(&env, &credit_contract).get_score(&borrower);
         if credit_score < min_credit_score {
             return Err(Error::LowCreditScore);
@@ -671,6 +678,7 @@ impl LendingPool {
             .checked_div(10_000)
             .unwrap_or(i128::MAX);
 
+        let borrow_ledger_key = DataKey::BlockBorrowLedger(borrower.clone());
         let borrow_ledger: u32 = env
             .storage()
             .persistent()
@@ -1251,6 +1259,16 @@ mod test {
         }
     }
 
+    #[contract]
+    pub struct MockRbac;
+
+    #[contractimpl]
+    impl MockRbac {
+        pub fn has_role(_env: Env, _role: Symbol, _account: Address) -> bool {
+            true
+        }
+    }
+
     struct Fixture {
         env: Env,
         admin: Address,
@@ -1270,9 +1288,11 @@ mod test {
         let score_id = env.register_contract(None, MockCreditScore);
         let score = MockCreditScoreClient::new(&env, &score_id);
 
+        let rbac_id = env.register_contract(None, MockRbac);
+
         let pool_id = env.register_contract(None, LendingPool);
         let pool = LendingPoolClient::new(&env, &pool_id);
-        pool.initialize(&admin, &token_id, &score_id);
+        pool.initialize(&admin, &token_id, &score_id, &rbac_id);
 
         // Seed the pool with liquidity from a lender.
         let lender = Address::generate(&env);
@@ -1304,6 +1324,32 @@ mod test {
     fn test_default_min_credit_score_is_600() {
         let f = setup();
         assert_eq!(f.pool.get_min_credit_score(), 600);
+    }
+
+    #[test]
+    fn test_get_all_params_defaults_and_updates() {
+        let f = setup();
+        let params = f.pool.get_all_params();
+        let expected = [
+            (key_min_bond(), DEFAULT_MIN_BOND),
+            (key_min_credit_score(), DEFAULT_MIN_CREDIT_SCORE),
+            (key_interest_rate_bps(), DEFAULT_INTEREST_RATE_BPS),
+            (key_platform_fee_bps(), DEFAULT_PLATFORM_FEE_BPS),
+            (key_cooldown_days(), DEFAULT_COOLDOWN_DAYS),
+            (key_tier_bronze(), DEFAULT_TIER_BRONZE),
+            (key_tier_silver(), DEFAULT_TIER_SILVER),
+            (key_tier_gold(), DEFAULT_TIER_GOLD),
+            (key_sub_expiry_grace(), DEFAULT_SUB_EXPIRY_GRACE),
+        ];
+
+        assert_eq!(params.len(), expected.len() as u32);
+        for (index, expected_param) in expected.iter().enumerate() {
+            assert_eq!(params.get(index as u32).unwrap(), expected_param.clone());
+        }
+
+        f.pool.set_param(&f.admin, &key_interest_rate_bps(), &350);
+        let updated = f.pool.get_all_params();
+        assert_eq!(updated.get(2).unwrap(), (key_interest_rate_bps(), 350));
     }
 
     #[test]

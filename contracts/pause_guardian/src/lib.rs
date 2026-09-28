@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
 
 const PAUSED: Symbol = symbol_short!("PAUSED");
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -38,6 +40,55 @@ pub struct YieldHealth {
     pub last_checked_at: u64,
 }
 
+#[contractevent]
+#[derive(Clone)]
+struct GuardianAddressEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    addr: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianPausedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    paused: bool,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianCbTrippedEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    count: u32,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianUnitEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone)]
+struct GuardianTimestampEvent {
+    #[topic]
+    category: Symbol,
+    #[topic]
+    action: Symbol,
+    timestamp: u64,
+}
+
 #[contract]
 pub struct PauseGuardian;
 
@@ -52,10 +103,12 @@ impl PauseGuardian {
         env.storage().instance().set(&PAUSED, &false);
         env.storage().instance().set(&FAILURES, &0u32);
         env.storage().instance().set(&IFACE_VALID, &false);
-        env.events().publish(
-            (symbol_short!("guardian"), symbol_short!("init")),
-            admin,
-        );
+        GuardianAddressEvent {
+            category: symbol_short!("guardian"),
+            action: symbol_short!("init"),
+            addr: admin,
+        }
+        .publish(&env);
     }
 
     // ─── Core pause / unpause ─────────────────────────────────────────────
@@ -69,10 +122,12 @@ impl PauseGuardian {
         if !value {
             env.storage().instance().set(&FAILURES, &0u32);
         }
-        env.events().publish(
-            (symbol_short!("guardian"), symbol_short!("paused")),
-            value,
-        );
+        GuardianPausedEvent {
+            category: symbol_short!("guardian"),
+            action: symbol_short!("paused"),
+            paused: value,
+        }
+        .publish(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -95,10 +150,12 @@ impl PauseGuardian {
             env.storage().instance().set(&PAUSED, &true);
             if !was_paused {
                 // Emit once when the breaker first trips to aid monitoring.
-                env.events().publish(
-                    (symbol_short!("guardian"), symbol_short!("cb_trip")),
-                    next,
-                );
+                GuardianCbTrippedEvent {
+                    category: symbol_short!("guardian"),
+                    action: symbol_short!("cb_trip"),
+                    count: next,
+                }
+                .publish(&env);
             }
         }
     }
@@ -216,6 +273,44 @@ impl PauseGuardian {
         let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
         let validated: bool = env.storage().instance().get(&IFACE_VALID).unwrap_or(false);
         paused || !validated
+    }
+
+    // ── System health monitoring & service disruption detection (#901) ──────
+
+    /// Monitor overall system health by checking failure rates and
+    /// circuit breaker status.
+    pub fn monitor_system_health(env: Env) -> bool {
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        let failures: u32 = env.storage().instance().get(&FAILURES).unwrap_or(0);
+        let validated: bool = env.storage().instance().get(&IFACE_VALID).unwrap_or(false);
+
+        // System is healthy when: not paused, failures below threshold, and
+        // yield interface has been validated.
+        !paused && failures < CIRCUIT_THRESHOLD && validated
+    }
+
+    /// Detect whether a service disruption is occurring by analyzing
+    /// the recent failure pattern.
+    pub fn detect_service_disruption(env: Env) -> bool {
+        let failures: u32 = env.storage().instance().get(&FAILURES).unwrap_or(0);
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+
+        // Disruption detected when circuit is tripped or failures are
+        // approaching the threshold.
+        paused || failures >= CIRCUIT_THRESHOLD.saturating_sub(1)
+    }
+
+    /// Activate additional protections by engaging the circuit breaker
+    /// and recording the disruption event.
+    pub fn activate_protections(env: Env) {
+        let was_paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        if !was_paused {
+            env.storage().instance().set(&PAUSED, &true);
+            env.events().publish(
+                (symbol_short!("guardian"), symbol_short!("prot_on")),
+                env.ledger().timestamp(),
+            );
+        }
     }
 }
 
@@ -396,5 +491,47 @@ mod tests {
         let yield_addr = Address::generate(&env);
         client.set_yield_contract(&yield_addr);
         assert_eq!(client.get_yield_contract(), Some(yield_addr));
+    }
+
+    // ── System health monitoring (#901) ─────────────────────────────────────
+
+    #[test]
+    fn test_monitor_system_health_healthy_initially() {
+        let (_env, _admin, client) = setup();
+        // Initially not paused, 0 failures, but interface not validated.
+        // System is NOT healthy because validated is false.
+        assert!(!client.monitor_system_health());
+    }
+
+    #[test]
+    fn test_monitor_system_health_healthy_when_validated() {
+        let (env, _admin, client) = setup();
+        let yield_addr = Address::generate(&env);
+        client.set_yield_contract(&yield_addr);
+        client.validate_yield_interface(&yield_addr);
+        // Now: not paused, 0 failures, validated = true
+        assert!(client.monitor_system_health());
+    }
+
+    #[test]
+    fn test_detect_service_disruption_no_disruption_initially() {
+        let (_env, _admin, client) = setup();
+        // 0 failures, not paused → no disruption.
+        assert!(!client.detect_service_disruption());
+    }
+
+    #[test]
+    fn test_detect_service_disruption_when_paused() {
+        let (_env, _admin, client) = setup();
+        client.set_paused(&true);
+        assert!(client.detect_service_disruption());
+    }
+
+    #[test]
+    fn test_activate_protections_engages_circuit_breaker() {
+        let (_env, _admin, client) = setup();
+        assert!(!client.is_paused());
+        client.activate_protections();
+        assert!(client.is_paused());
     }
 }

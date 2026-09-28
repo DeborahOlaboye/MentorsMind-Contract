@@ -1,6 +1,37 @@
 #![no_std]
 
 use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+};
+
+/// Instance storage: frequently read config.
+const ADMIN: Symbol = symbol_short!("ADMIN");
+const SNAPSHOT: Symbol = symbol_short!("SNAPSHOT");
+
+/// Maximum number of delegation hops resolved when attributing weight.
+///
+/// Chains longer than this are capped rather than followed, so a cycle that
+/// somehow reaches storage cannot make weight resolution loop forever or blow
+/// the transaction's budget.
+pub const MAX_CHAIN_DEPTH: u32 = 8;
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// Outgoing delegation: delegator -> delegate.
+    Delegation(Address),
+    /// Reverse index: delegate -> the delegators pointing at it.
+    Delegators(Address),
+}
+
+/// Governance snapshot contract this registry reads base weight from.
+#[contractclient(name = "SnapshotClient")]
+pub trait SnapshotTrait {
+    fn get_voting_power(env: Env, proposal_id: u32, voter: Address) -> i128;
+use shared::events::{
+    emit_delegation_event, evt_del_delegated, evt_del_suspended, evt_del_undelegated,
+};
+use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
 };
 
@@ -26,6 +57,12 @@ pub enum DataKey {
     DelegationAtSnapshot(u32, Address),
     /// Snapshot-time delegated power cache: (snapshot_id, delegate) -> total delegated power
     DelegationSnapshot(u32, Address),
+    /// Admin-configured concentration cap. Defaults to 10_000 for backward
+    /// compatibility; governance can lower it to enforce anti-capture policy.
+    MaxDelegatedPowerBps,
+    /// Emergency switch that forces direct voting fallback by blocking new
+    /// delegation writes while preserving existing read-only snapshots.
+    DelegationSuspended,
 }
 
 #[contracterror]
@@ -34,6 +71,8 @@ pub enum DataKey {
 pub enum DelegationError {
     CircularDelegation = 1,
     DepthExceeded = 2,
+    ConcentrationExceeded = 3,
+    DelegationSuspended = 4,
 }
 
 #[contracttype]
@@ -54,6 +93,27 @@ pub struct DelegationContract;
 
 #[contractimpl]
 impl DelegationContract {
+    /// One-time setup. `snapshot_contract` is the governance snapshot
+    /// registry the delegation weights are resolved against.
+    pub fn initialize(env: Env, admin: Address, snapshot_contract: Address) {
+        if env.storage().instance().has(&ADMIN) {
+            panic!("already initialized");
+        }
+
+        env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&SNAPSHOT, &snapshot_contract);
+    }
+
+    /// Delegates all of the caller's governance weight to `delegate`.
+    ///
+    /// Rejects self-delegation and any delegation that would close a cycle,
+    /// detected by walking the delegate's existing chain up to
+    /// `MAX_CHAIN_DEPTH` hops. Re-delegating moves the weight rather than
+    /// duplicating it.
+    pub fn delegate(env: Env, delegator: Address, delegate: Address) {
+        Self::require_initialized(&env);
+        delegator.require_auth();
+
     pub fn initialize(env: Env, admin: Address, mnt_token: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
@@ -64,6 +124,13 @@ impl DelegationContract {
         env.storage()
             .instance()
             .set(&DataKey::MaxDelegationDepth, &10u32);
+        env.storage().instance().set(
+            &DataKey::MaxDelegatedPowerBps,
+            &shared::DEFAULT_DELEGATION_CAP_BPS,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationSuspended, &false);
     }
 
     pub fn set_max_delegation_depth(env: Env, admin: Address, depth: u32) {
@@ -89,6 +156,64 @@ impl DelegationContract {
             .instance()
             .get(&DataKey::MaxDelegationDepth)
             .unwrap_or(10u32)
+    }
+
+    pub fn set_delegation_power_cap_bps(env: Env, admin: Address, cap_bps: u32) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+        if cap_bps == 0 || cap_bps > 10_000 {
+            panic!("cap must be between 1 and 10000 bps");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDelegatedPowerBps, &cap_bps);
+    }
+
+    pub fn get_delegation_power_cap_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxDelegatedPowerBps)
+            .unwrap_or(shared::DEFAULT_DELEGATION_CAP_BPS)
+    }
+
+    pub fn set_delegation_suspended(env: Env, admin: Address, suspended: bool) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationSuspended, &suspended);
+        emit_delegation_event(&env, evt_del_suspended(&env), suspended);
+    }
+
+    pub fn is_delegation_suspended(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::DelegationSuspended)
+            .unwrap_or(false)
+    }
+
+    pub fn assess_delegate_concentration(
+        env: Env,
+        delegate: Address,
+    ) -> shared::DelegationConcentrationReport {
+        let total = Self::total_delegated_balance(&env);
+        let delegate_power = Self::get_delegated_power(env.clone(), delegate);
+        let cap = Self::get_delegation_power_cap_bps(env);
+        shared::assess_delegation_concentration(total, delegate_power, cap)
     }
 
     /// Validate delegation chain and return its depth.
@@ -146,10 +271,27 @@ impl DelegationContract {
 
     pub fn delegate(env: Env, delegator: Address, delegate: Address) {
         delegator.require_auth();
+        if Self::is_delegation_suspended(env.clone()) {
+            panic!("delegation suspended");
+        }
         if delegator == delegate {
             panic!("cannot delegate to self");
         }
 
+        Self::require_acyclic(&env, &delegator, &delegate);
+
+        // Drop any previous delegation first so weight is never counted twice.
+        Self::unlink(&env, &delegator);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegator.clone()), &delegate);
+
+        let mut delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
         // Validate delegation chain at registration time
         match Self::validate_delegation_chain(env.clone(), delegator.clone(), delegate.clone()) {
             Ok(_) => {
@@ -180,31 +322,209 @@ impl DelegationContract {
             Self::propagate_weight_change(&env, &prev, -weight, max_depth);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Delegate(delegator.clone()), &delegate.clone());
-
         // Add delegator to delegators list if not present
         let mut delegators: soroban_sdk::Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::Delegators)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let cap = Self::get_delegation_power_cap_bps(env.clone());
+        if cap < shared::DEFAULT_DELEGATION_CAP_BPS {
+            let total_after = Self::total_delegated_balance_from(&env, &delegators, &delegator);
+            let current_delegate_power = Self::get_delegated_power(env.clone(), delegate.clone());
+            let projected = current_delegate_power
+                .checked_add(weight)
+                .expect("overflow");
+            let report = shared::assess_delegation_concentration(total_after, projected, cap);
+            if report.cap_exceeded {
+                if let Some(prev) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey::Delegate(delegator.clone()))
+                {
+                    Self::propagate_weight_change(&env, &prev, weight, max_depth);
+                }
+                panic!("delegation concentration cap exceeded");
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegate(delegator.clone()), &delegate.clone());
+
         if !delegators.contains(&delegator) {
             delegators.push_back(delegator.clone());
             env.storage()
                 .persistent()
+                .set(&DataKey::Delegators(delegate.clone()), &delegators);
+        }
+
+        env.events()
+            .publish((Symbol::new(&env, "delegated"), delegator), delegate);
+    }
+
+    /// Cancels the caller's outgoing delegation, returning its weight to it.
+    pub fn revoke(env: Env, delegator: Address) {
+        Self::require_initialized(&env);
+        delegator.require_auth();
+
+        if Self::get_delegate(env.clone(), delegator.clone()).is_none() {
+            panic!("no delegation to revoke");
+        }
+
+        Self::unlink(&env, &delegator);
+
+        env.events()
+            .publish((Symbol::new(&env, "revoked"), delegator), ());
+    }
+
+    /// Who `delegator` delegated to, if anyone.
+    pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegator))
+    }
+
+    /// Everyone currently delegating to `delegate`.
+    pub fn get_delegators(env: Env, delegate: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegators(delegate))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// The holder's own weight as recorded by the governance snapshot
+    /// contract, ignoring any delegation.
+    pub fn get_base_weight(env: Env, proposal_id: u32, holder: Address) -> i128 {
+        Self::require_initialized(&env);
+
+        let snapshot: Address = env
+            .storage()
+            .instance()
+            .get(&SNAPSHOT)
+            .expect("snapshot not set");
+
+        SnapshotClient::new(&env, &snapshot).get_voting_power(&proposal_id, &holder)
+    }
+
+    /// Weight `holder` may vote with on `proposal_id`.
+    ///
+    /// Weight flows to the end of the chain, so a delegator that has delegated
+    /// votes with zero and the final delegate votes with its own weight plus
+    /// everything routed to it. Chains resolve to at most `MAX_CHAIN_DEPTH`
+    /// hops; anything deeper is dropped rather than followed.
+    pub fn get_voting_weight(env: Env, proposal_id: u32, holder: Address) -> i128 {
+        Self::require_initialized(&env);
+
+        if Self::get_delegate(env.clone(), holder.clone()).is_some() {
+            return 0;
+        }
+
+        Self::get_base_weight(env.clone(), proposal_id, holder.clone())
+            .checked_add(Self::resolve(env.clone(), proposal_id, &holder, 0))
+            .unwrap_or_else(|| panic!("delegated weight overflow"))
+    }
+
+    /// Walks the delegation tree below `holder`, adding the weight each
+    /// delegator contributed. `holder`'s own weight is excluded because the
+    /// caller already counted it.
+    fn resolve(env: Env, proposal_id: u32, holder: &Address, depth: u32) -> i128 {
+        if depth >= MAX_CHAIN_DEPTH {
+            return 0;
+        }
+
+        let mut total: i128 = 0;
+
+        for delegator in Self::get_delegators(env.clone(), holder.clone()).iter() {
+            let contributed = Self::get_base_weight(env.clone(), proposal_id, delegator.clone())
+                .checked_add(Self::resolve(
+                    env.clone(),
+                    proposal_id,
+                    &delegator,
+                    depth + 1,
+                ))
+                .unwrap_or_else(|| panic!("delegated weight overflow"));
+
+            total = total
+                .checked_add(contributed)
+                .unwrap_or_else(|| panic!("delegated weight overflow"));
+        }
+
+        total
+    }
+
+    /// Rejects a delegation that would close a cycle, and caps chains that
+    /// already sit at the depth limit.
+    fn require_acyclic(env: &Env, delegator: &Address, delegate: &Address) {
+        let mut current = delegate.clone();
+
+        for _ in 0..MAX_CHAIN_DEPTH {
+            if &current == delegator {
+                panic!("circular delegation");
+            }
+
+            match Self::get_delegate(env.clone(), current.clone()) {
+                Some(next) => current = next,
+                None => return,
+            }
+        }
+
+        panic!("delegation chain too deep");
+    }
+
+    /// Removes the delegator's outgoing delegation from both indexes.
+    fn unlink(env: &Env, delegator: &Address) {
+        let delegate = match Self::get_delegate(env.clone(), delegator.clone()) {
+            Some(d) => d,
+            None => return,
+        };
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Delegation(delegator.clone()));
+
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut remaining = Vec::new(env);
+        for d in delegators.iter() {
+            if &d != delegator {
+                remaining.push_back(d);
+            }
+        }
+
+        if remaining.is_empty() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Delegators(delegate));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Delegators(delegate), &remaining);
+        }
+    }
+
+    fn require_initialized(env: &Env) {
+        if !env.storage().instance().has(&ADMIN) {
+            panic!("not initialized");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
                 .set(&DataKey::Delegators, &delegators);
         }
 
         Self::propagate_weight_change(&env, &delegate, weight, max_depth);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "delegation"),
-                Symbol::new(&env, "delegated"),
-                delegator.clone(),
-            ),
+        emit_delegation_event(
+            &env,
+            evt_del_delegated(&env),
             DelegatedEventData {
                 delegator,
                 delegate,
@@ -245,12 +565,9 @@ impl DelegationContract {
 
         Self::propagate_weight_change(&env, &delegate, -weight, max_depth);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "delegation"),
-                Symbol::new(&env, "undelegated"),
-                delegator.clone(),
-            ),
+        emit_delegation_event(
+            &env,
+            evt_del_undelegated(&env),
             UndelegatedEventData { delegator },
         );
     }
@@ -378,17 +695,11 @@ impl DelegationContract {
 
                 // Accumulate delegated power for the delegate at this snapshot
                 if balance > 0 {
-                    let power_key =
-                        DataKey::DelegationSnapshot(snapshot_id, delegate.clone());
-                    let current: i128 = env
-                        .storage()
+                    let power_key = DataKey::DelegationSnapshot(snapshot_id, delegate.clone());
+                    let current: i128 = env.storage().persistent().get(&power_key).unwrap_or(0);
+                    env.storage()
                         .persistent()
-                        .get(&power_key)
-                        .unwrap_or(0);
-                    env.storage().persistent().set(
-                        &power_key,
-                        &current.checked_add(balance).expect("overflow"),
-                    );
+                        .set(&power_key, &current.checked_add(balance).expect("overflow"));
                     env.storage().persistent().extend_ttl(
                         &power_key,
                         ninety_days_ledgers,
@@ -414,11 +725,7 @@ impl DelegationContract {
     /// Get the total delegated power received by `delegate` at a specific snapshot.
     /// Returns the sum of staked balances (at snapshot time) of all delegators
     /// whose delegate (at snapshot time) is the given address.
-    pub fn get_delegated_power_at_snapshot(
-        env: Env,
-        delegate: Address,
-        snapshot_id: u32,
-    ) -> i128 {
+    pub fn get_delegated_power_at_snapshot(env: Env, delegate: Address, snapshot_id: u32) -> i128 {
         env.storage()
             .persistent()
             .get(&DataKey::DelegationSnapshot(snapshot_id, delegate))
@@ -497,6 +804,40 @@ impl DelegationContract {
             .expect("token not set");
         let client = soroban_sdk::token::Client::new(env, &token);
         client.balance(addr)
+    }
+
+    fn total_delegated_balance(env: &Env) -> i128 {
+        let delegators: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegators)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        let mut total = 0i128;
+        for delegator in delegators.iter() {
+            total = total
+                .checked_add(Self::token_balance(env, &delegator))
+                .expect("overflow");
+        }
+        total
+    }
+
+    fn total_delegated_balance_from(
+        env: &Env,
+        delegators: &soroban_sdk::Vec<Address>,
+        pending: &Address,
+    ) -> i128 {
+        let mut total = 0i128;
+        for delegator in delegators.iter() {
+            total = total
+                .checked_add(Self::token_balance(env, &delegator))
+                .expect("overflow");
+        }
+        if !delegators.contains(pending) {
+            total = total
+                .checked_add(Self::token_balance(env, pending))
+                .expect("overflow");
+        }
+        total
     }
 }
 

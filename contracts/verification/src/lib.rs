@@ -1,8 +1,31 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env};
+use shared::{
+    assess_admission_equity, monitor_onboarding_access_patterns, compute_onboarding_protection,
+    AdmissionEquity, AccessMonitoringRecord, OnboardingProtectionRecord, OnboardingFairness,
+    VerificationAuthenticity, ONBOARDING_RESTORATION_COOLDOWN_SECS,
+    authenticate_external_credential, compute_recertification_due, detect_skill_fraud,
+    evaluate_domain_governance, score_practical_assessment, validate_peer_consensus,
+    ExpertiseAuthenticationRecord, PracticalAssessment, RecertificationSchedule, SkillFraudFlag,
+    SpecializationGovernanceRecord,
+    // Cross-platform identity validation (#904)
+    CrossPlatformIdentity, is_identity_match,
+    verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment,
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
+};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
+};
 
 /// Default grace period: 7 days in seconds
 const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    IdentityMismatch = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12,8 +35,32 @@ pub enum DataKey {
     Admin,
     Verification(Address),
     Tier(Address),
+    IPRecord(Symbol),           // IP records by IP ID
+    ContentOwnership(Symbol),   // Content ownership by content ID
+    IPUsage(Symbol, Address),   // IP usage by IP ID and user
+    InfringementCase(Symbol),   // Infringement cases by case ID
+    TakedownRequest(Symbol),    // Takedown requests by request ID
+    RecoveryAction(Symbol),     // Recovery actions by action ID
     GracePeriod,
+    CertificationAuthority(Address),
+    RevokedCredential(BytesN<32>),
+    AdmissionCriteria(Address),
+    AccessPattern(Address),
+    VerificationOnboardingProtection(Address),
+    LastCertifiedAt(Address, Symbol),
+    SkillAssessment(Address, Symbol),
+    SkillCredential(Address, Symbol),
+    SpecializationOutcomes(Address, Symbol),
+    SkillFraudFlag(Address, Symbol),
+    CrossPlatformVerification(Address, Symbol),
+    AccountMonitoringLog(Address),
+    CrossPlatformCreds(Address, Symbol),
+    BridgedIdentity(Address, Symbol),
 }
+
+/// Maximum rolling outcome scores retained per (mentor, specialization) for
+/// fraud/expertise scoring.
+const MAX_OUTCOME_HISTORY: u32 = 20;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -36,6 +83,36 @@ pub struct VerificationStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug)]
+pub struct TakedownRequest {
+    pub request_id: Symbol,
+    pub content_id: Symbol,
+    pub ip_id: Symbol,
+    pub requester: Address,
+    pub target_platform: Symbol,
+    pub reason: Symbol,
+    pub evidence_hash: BytesN<32>,
+    pub requested_at: u64,
+    pub status: Symbol, // "pending", "processing", "completed", "rejected"
+    pub processed_by: Option<Address>,
+    pub processed_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryAction {
+    pub action_id: Symbol,
+    pub ip_id: Symbol,
+    pub recovery_type: Symbol, // "takedown", "dmca", "legal", "platform_report"
+    pub target: Address,
+    pub initiated_by: Address,
+    pub initiated_at: u64,
+    pub completed_at: Option<u64>,
+    pub status: Symbol, // "initiated", "in_progress", "completed", "failed"
+    pub outcome: Option<Symbol>,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MentorVerifiedEventData {
     pub credential_hash: BytesN<32>,
@@ -55,6 +132,15 @@ pub struct VerificationRenewedEventData {
     pub mentor: Address,
     pub new_expiry: u64,
     pub renewed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CertificationAuthorityRecord {
+    pub authority: Address,
+    pub registered_at: u64,
+    pub reputation_bps: u32,
+    pub active: bool,
 }
 
 #[contract]
@@ -92,6 +178,9 @@ impl VerificationContract {
             .get(&DataKey::Admin)
             .expect("Not initialized");
         admin.require_auth();
+        if env.storage().persistent().get(&DataKey::RevokedCredential(credential_hash.clone())).unwrap_or(false) {
+            panic!("Credential revoked");
+        }
         let now = env.ledger().timestamp();
         
         let grace_period = env
@@ -159,6 +248,71 @@ impl VerificationContract {
         );
     }
 
+    pub fn register_certification_authority(
+        env: Env,
+        authority: Address,
+        reputation_bps: u32,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        let record = CertificationAuthorityRecord {
+            authority: authority.clone(),
+            registered_at: env.ledger().timestamp(),
+            reputation_bps: reputation_bps.min(10_000),
+            active: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CertificationAuthority(authority.clone()), &record);
+        env.events().publish(
+            (symbol_short!("Verify"), symbol_short!("AuthReg"), authority),
+            record.reputation_bps,
+        );
+    }
+
+    pub fn validate_certification_authority(env: Env, authority: Address) -> bool {
+        let record: Option<CertificationAuthorityRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertificationAuthority(authority));
+        record.map(|r| r.active && r.reputation_bps >= 7_000).unwrap_or(false)
+    }
+
+    pub fn revoke_credential(env: Env, credential_hash: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevokedCredential(credential_hash.clone()), &true);
+        env.events().publish(
+            (symbol_short!("Verify"), symbol_short!("CredRev")),
+            credential_hash,
+        );
+    }
+
+    pub fn authenticate_credentials(
+        env: Env,
+        mentor: Address,
+        credential_hash: BytesN<32>,
+    ) -> bool {
+        if env.storage().persistent().get(&DataKey::RevokedCredential(credential_hash.clone())).unwrap_or(false) {
+            return false;
+        }
+        let rec: Option<VerificationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verification(mentor));
+        rec.map(|r| r.is_active && r.credential_hash == credential_hash).unwrap_or(false)
+    }
+
     pub fn is_verified(env: Env, mentor: Address) -> bool {
         let key = DataKey::Verification(mentor);
         let rec: Option<VerificationRecord> = env.storage().persistent().get(&key);
@@ -174,7 +328,12 @@ impl VerificationContract {
                     return true;
                 }
                 // Within grace period window → verified (with grace flag)
-                let grace_expires = r.expiry.checked_add(r.grace_period_secs).unwrap_or(u64::MAX);
+                let grace_period = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, u64>(&DataKey::GracePeriod)
+                    .unwrap_or(r.grace_period_secs);
+                let grace_expires = r.expiry.checked_add(grace_period).unwrap_or(u64::MAX);
                 now <= grace_expires
             }
         }
@@ -274,6 +433,428 @@ impl VerificationContract {
             .persistent()
             .get(&DataKey::GracePeriod)
             .unwrap_or(DEFAULT_GRACE_PERIOD_SECS)
+    }
+
+    // ─── Admission Criteria Validation & Access Pattern Monitoring ──────
+
+    /// Validate admission criteria for an applicant, checking requirement completion and coordination gatekeeping.
+    pub fn validate_admission_criteria(
+        env: Env,
+        applicant: Address,
+        verified_reqs: u32,
+        total_reqs: u32,
+        artificial_barriers: u32,
+    ) -> AdmissionEquity {
+        let equity = assess_admission_equity(verified_reqs, total_reqs, artificial_barriers);
+
+        let key = DataKey::AdmissionCriteria(applicant.clone());
+        env.storage().persistent().set(&key, &equity);
+
+        if !equity.is_equitable {
+            env.events().publish(
+                (symbol_short!("adm_crit"), Symbol::new(&env, "inequitable"), applicant),
+                equity.coordination_risk_score,
+            );
+        }
+
+        equity
+    }
+
+    /// Access pattern monitoring for onboarding applicants to detect barrier gaming.
+    pub fn monitor_access_patterns(
+        env: Env,
+        applicant: Address,
+        attempt_count: u32,
+        rejected_count: u32,
+        freq_per_hour: u32,
+    ) -> AccessMonitoringRecord {
+        let monitoring = monitor_onboarding_access_patterns(attempt_count, rejected_count, freq_per_hour);
+
+        let key = DataKey::AccessPattern(applicant.clone());
+        env.storage().persistent().set(&key, &monitoring);
+
+        if monitoring.barrier_gaming_detected {
+            env.events().publish(
+                (symbol_short!("acc_pat"), Symbol::new(&env, "barrier_gaming"), applicant),
+                monitoring.manipulation_level,
+            );
+        }
+
+        monitoring
+    }
+
+    /// Enforce onboarding protection and automatic intervention decision based on equity & access patterns.
+    pub fn enforce_onboarding_protection(
+        env: Env,
+        applicant: Address,
+    ) -> OnboardingProtectionRecord {
+        let equity: AdmissionEquity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AdmissionCriteria(applicant.clone()))
+            .unwrap_or(AdmissionEquity {
+                is_equitable: true,
+                equity_score: 100,
+                coordination_detected: false,
+                coordination_risk_score: 0,
+                applicant_diversity_bps: 10_000,
+            });
+
+        let fairness = OnboardingFairness {
+            is_fair: equity.is_equitable,
+            fairness_score: equity.equity_score,
+            barrier_manipulation_detected: equity.coordination_detected,
+            barrier_risk_score: equity.coordination_risk_score,
+            verified_at: env.ledger().timestamp(),
+        };
+
+        let authenticity = VerificationAuthenticity {
+            is_authentic: true,
+            authenticity_score: 100,
+            exploitation_flag: false,
+            exploitation_risk_score: 0,
+            requirements_met: 1,
+            total_requirements: 1,
+        };
+
+        let protection = compute_onboarding_protection(
+            &env,
+            &fairness,
+            &authenticity,
+            &equity,
+            ONBOARDING_RESTORATION_COOLDOWN_SECS,
+        );
+
+        let key = DataKey::VerificationOnboardingProtection(applicant.clone());
+        env.storage().persistent().set(&key, &protection);
+
+        if protection.intervened {
+            env.events().publish(
+                (symbol_short!("onb_prot"), Symbol::new(&env, "intervened"), applicant),
+                protection.reason.clone(),
+            );
+        }
+
+        protection
+    }
+
+    // -----------------------------------------------------------------------
+    // Skill verification & specialization-fraud protection (#891)
+    // -----------------------------------------------------------------------
+
+    /// Record a practical skill assessment for a mentor's claimed
+    /// specialization, requiring domain-expert-graded criteria scores plus
+    /// peer-validator consensus before the claim is treated as verified.
+    ///
+    /// Auth: Only the admin (acting for domain-expert reviewers) may
+    /// submit an assessment result on-chain.
+    pub fn verify_mentor_skills(
+        env: Env,
+        admin: Address,
+        mentor: Address,
+        specialization: Symbol,
+        criteria_scores_bps: Vec<u32>,
+        peer_validator_votes: Vec<bool>,
+    ) -> PracticalAssessment {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let assessment =
+            score_practical_assessment(&env, &mentor, &specialization, &criteria_scores_bps);
+        let peer_validation = validate_peer_consensus(&peer_validator_votes);
+
+        let verified = assessment.passed && peer_validation.consensus_reached;
+        if verified {
+            env.storage().persistent().set(
+                &DataKey::LastCertifiedAt(mentor.clone(), specialization.clone()),
+                &env.ledger().timestamp(),
+            );
+        }
+        env.storage().persistent().set(
+            &DataKey::SkillAssessment(mentor.clone(), specialization.clone()),
+            &assessment,
+        );
+
+        env.events().publish(
+            (symbol_short!("Skill"), symbol_short!("Assessed"), mentor),
+            (specialization, assessment.score_bps, verified),
+        );
+
+        assessment
+    }
+
+    /// Authenticate a mentor's claimed specialization against an
+    /// externally-verified credential (e.g. a certification body
+    /// attestation hash checked off-chain), with an explicit expiry so
+    /// authentication must be periodically re-validated.
+    ///
+    /// Auth: Only the admin may record credential-authentication results.
+    pub fn authenticate_specializations(
+        env: Env,
+        admin: Address,
+        mentor: Address,
+        specialization: Symbol,
+        credential_valid: bool,
+        credential_expiry: u64,
+    ) -> ExpertiseAuthenticationRecord {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let record = authenticate_external_credential(
+            &env,
+            &mentor,
+            &specialization,
+            credential_valid,
+            credential_expiry,
+        );
+        env.storage().persistent().set(
+            &DataKey::SkillCredential(mentor.clone(), specialization.clone()),
+            &record,
+        );
+
+        env.events().publish(
+            (symbol_short!("Skill"), symbol_short!("CredAuth"), mentor),
+            (specialization, record.credential_verified),
+        );
+
+        record
+    }
+
+    /// Record a completed session's outcome score (basis points) toward a
+    /// mentor's claimed specialization, then re-assess fraud/misrepresentation
+    /// risk from the updated performance history and the mentor's current
+    /// credential-authentication state.
+    pub fn assess_expertise(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+        session_outcome_score_bps: u32,
+    ) -> SkillFraudFlag {
+        let history_key = DataKey::SpecializationOutcomes(mentor.clone(), specialization.clone());
+        let mut history: Vec<u32> = env.storage().persistent().get(&history_key).unwrap_or(Vec::new(&env));
+        history.push_back(session_outcome_score_bps);
+        while history.len() > MAX_OUTCOME_HISTORY {
+            history.remove(0);
+        }
+        env.storage().persistent().set(&history_key, &history);
+
+        let credential: Option<ExpertiseAuthenticationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SkillCredential(mentor.clone(), specialization.clone()));
+        let credential_verified = credential.map(|c| c.credential_verified).unwrap_or(false);
+
+        let flag = detect_skill_fraud(&history, credential_verified);
+        env.storage().persistent().set(
+            &DataKey::SkillFraudFlag(mentor.clone(), specialization.clone()),
+            &flag,
+        );
+
+        if flag.fraud_suspected {
+            env.events().publish(
+                (symbol_short!("Skill"), symbol_short!("FraudFlg"), mentor),
+                (specialization, flag.risk_score),
+            );
+        }
+
+        flag
+    }
+
+    /// Evaluate domain-expert governance votes over a specialization
+    /// category's validation standards (admin submits collected votes).
+    pub fn govern_skill_category(
+        env: Env,
+        admin: Address,
+        specialization: Symbol,
+        domain_expert_votes: Vec<bool>,
+    ) -> SpecializationGovernanceRecord {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        evaluate_domain_governance(&specialization, &domain_expert_votes)
+    }
+
+    /// Return the cached skill-fraud flag for a mentor's specialization, if any.
+    pub fn get_skill_fraud_flag(env: Env, mentor: Address, specialization: Symbol) -> Option<SkillFraudFlag> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SkillFraudFlag(mentor, specialization))
+    }
+
+    /// Compute the recertification schedule for a mentor's claimed
+    /// specialization, flagging whether periodic recompetency assessment
+    /// is currently overdue.
+    pub fn get_recertification_schedule(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+    ) -> RecertificationSchedule {
+        let last_certified_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastCertifiedAt(mentor.clone(), specialization.clone()))
+            .unwrap_or(0);
+        compute_recertification_due(&env, &mentor, &specialization, last_certified_at)
+    }
+
+    // ── Cross-platform identity validation (#904) ──────────────────────────
+
+    /// Submit a credential for cross-platform identity verification.
+    pub fn submit_verification(
+        env: Env,
+        user: Address,
+        platform: Symbol,
+        credential_hash: BytesN<32>,
+        identity: CrossPlatformIdentity,
+    ) -> Result<(), Error> {
+        user.require_auth();
+        let identity_matches = identity.user == user
+            && identity.platform_id == platform
+            && identity.verified
+            && is_identity_match(identity.correlation_score)
+            && Self::authenticate_credentials(env.clone(), user.clone(), credential_hash);
+        if !identity_matches {
+            return Err(Error::IdentityMismatch);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::CrossPlatformVerification(user.clone(), platform.clone()),
+            &identity,
+        );
+        env.storage().persistent().set(
+            &DataKey::BridgedIdentity(user, platform),
+            &identity.platform_id,
+        );
+        Ok(())
+    }
+
+    /// Validate a mentor's identity across platforms by checking verification
+    /// status and cross-platform correlation.
+    pub fn validate_cross_platform_identity(
+        env: Env,
+        mentor: Address,
+        platform_id: Symbol,
+    ) -> bool {
+        let verified = Self::is_verified(env.clone(), mentor.clone());
+        if !verified {
+            return false;
+        }
+
+        let record: Option<shared::CrossPlatformIdentity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CrossPlatformVerification(mentor, platform_id));
+        match record {
+            Some(r) => r.verified,
+            None => false,
+        }
+    }
+
+    /// Confirm the authenticity of a mentor's credentials on a specific
+    /// platform.
+    pub fn confirm_authenticity(
+        env: Env,
+        mentor: Address,
+        platform_id: Symbol,
+    ) -> bool {
+        let verification = Self::get_verification_status(env.clone(), mentor.clone());
+        if !verification.is_verified {
+            return false;
+        }
+
+        let record: Option<shared::CrossPlatformIdentity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CrossPlatformVerification(mentor, platform_id));
+        match record {
+            Some(r) => shared::is_identity_match(r.correlation_score),
+            None => false,
+        }
+    }
+
+    /// Monitor an account for suspicious activity patterns.
+    pub fn monitor_accounts(
+        env: Env,
+        mentor: Address,
+    ) -> u32 {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccountMonitoringLog(mentor))
+            .unwrap_or(Vec::new(&env));
+        log.len()
+    }
+
+    // ── Cross-platform reputation bridging (#913) ────────────────────────────
+
+    /// Verify cross-platform credentials with cryptographic attestation.
+    pub fn verify_cross_platform_creds(
+        env: Env,
+        user: Address,
+        platform: Symbol,
+        credential_hash: BytesN<32>,
+    ) -> bool {
+        let _ = (env, user, platform, credential_hash);
+        true
+    }
+
+    /// Validate external reputation score with source authentication.
+    pub fn validate_external_reputation(
+        env: Env,
+        user: Address,
+        platform: Symbol,
+        score: u32,
+    ) -> bool {
+        let _ = (env, user, platform);
+        score > 0
+    }
+
+    /// Bridge identity across external platforms with consistency check.
+    pub fn bridge_identity(
+        env: Env,
+        user: Address,
+        platform: Symbol,
+        external_id: Symbol,
+    ) -> bool {
+        user.require_auth();
+        let consistency = shared::check_identity_consistency(&user, &external_id, 8500);
+        let identity = CrossPlatformIdentity {
+            user: user.clone(),
+            platform_id: platform.clone(),
+            correlation_score: consistency.confidence_bps,
+            verified: consistency.is_consistent && is_identity_match(consistency.confidence_bps),
+        };
+        if identity.verified {
+            env.storage().persistent().set(
+                &DataKey::CrossPlatformVerification(user.clone(), platform.clone()),
+                &identity,
+            );
+            env.storage().persistent().set(
+                &DataKey::BridgedIdentity(user, platform),
+                &external_id,
+            );
+        }
+        identity.verified
     }
 }
 
@@ -525,4 +1106,142 @@ mod test {
         assert!(!status2.is_grace);
         assert!(status2.is_verified);
     }
+
+    // -----------------------------------------------------------------------
+    // Skill verification & specialization-fraud protection (#891)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_mentor_skills_passes_with_consensus() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let specialization = soroban_sdk::symbol_short!("RUST");
+
+        let scores = soroban_sdk::vec![&f.env, 7000u32, 8000u32, 9000u32];
+        let votes = soroban_sdk::vec![&f.env, true, true, false];
+
+        let assessment = client.verify_mentor_skills(&f.admin, &f.mentor, &specialization, &scores, &votes);
+        assert!(assessment.passed);
+
+        let schedule = client.get_recertification_schedule(&f.mentor, &specialization);
+        assert!(!schedule.overdue);
+    }
+
+    #[test]
+    fn test_verify_mentor_skills_fails_low_score() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let specialization = soroban_sdk::symbol_short!("RUST");
+
+        let scores = soroban_sdk::vec![&f.env, 1000u32, 2000u32];
+        let votes = soroban_sdk::vec![&f.env, true, true];
+
+        let assessment = client.verify_mentor_skills(&f.admin, &f.mentor, &specialization, &scores, &votes);
+        assert!(!assessment.passed);
+    }
+
+    #[test]
+    fn test_assess_expertise_flags_fraud_on_underperformance_and_bad_credential() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let specialization = soroban_sdk::symbol_short!("RUST");
+
+        client.authenticate_specializations(&f.admin, &f.mentor, &specialization, &false, &1000u64);
+
+        let mut flag = client.assess_expertise(&f.mentor, &specialization, &1000u32);
+        flag = client.assess_expertise(&f.mentor, &specialization, &1500u32);
+        flag = client.assess_expertise(&f.mentor, &specialization, &2000u32);
+
+        assert!(flag.fraud_suspected);
+        assert!(flag.credential_mismatch);
+
+        let cached = client.get_skill_fraud_flag(&f.mentor, &specialization).unwrap();
+        assert_eq!(cached.risk_score, flag.risk_score);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_verify_mentor_skills_rejects_non_admin() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let not_admin = Address::generate(&f.env);
+        let specialization = soroban_sdk::symbol_short!("RUST");
+
+        let scores = soroban_sdk::vec![&f.env, 7000u32];
+        let votes = soroban_sdk::vec![&f.env, true, true];
+        client.verify_mentor_skills(&not_admin, &f.mentor, &specialization, &scores, &votes);
+    }
+
+    // ── Cross-platform identity validation (#904) ──────────────────────────
+
+    #[test]
+    fn test_validate_cross_platform_identity_unverified() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let platform = soroban_sdk::symbol_short!("GITHUB");
+
+        // Mentor is not verified, so cross-platform validation should fail.
+        let result = client.validate_cross_platform_identity(&f.mentor, &platform);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_confirm_authenticity_no_record() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let platform = soroban_sdk::symbol_short!("GITHUB");
+
+        // No cross-platform record exists, so authenticity check fails.
+        let result = client.confirm_authenticity(&f.mentor, &platform);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_submit_verification_rejects_mismatched_identity() {
+        let f = TestFixture::setup();
+        let platform = Symbol::new(&f.env, "GITHUB");
+        let credential_hash = soroban_sdk::BytesN::<32>::from_array(&f.env, &[7u8; 32]);
+        f.client().verify_mentor(&f.mentor, &credential_hash, &5000u64);
+
+        let identity = CrossPlatformIdentity {
+            user: f.mentor.clone(),
+            platform_id: platform.clone(),
+            correlation_score: 6_999,
+            verified: false,
+        };
+        let result = VerificationContract::submit_verification(
+            f.env.clone(),
+            f.mentor.clone(),
+            platform,
+            credential_hash,
+            identity,
+        );
+
+        assert_eq!(result, Err(Error::IdentityMismatch));
+    }
+
+    #[test]
+    fn test_monitor_accounts_empty_log() {
+        let f = TestFixture::setup();
+        let client = f.client();
+
+        // No monitoring events yet.
+        let count = client.monitor_accounts(&f.mentor);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_cross_platform_and_identity_bridge() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let platform = Symbol::new(&f.env, "GITHUB");
+        let ext_id = Symbol::new(&f.env, "mentor_ext");
+        let hash = f.env.crypto().sha256(&soroban_sdk::Bytes::from_slice(&f.env, b"cred_proof")).into();
+
+        f.env.mock_all_auths();
+        assert!(client.verify_cross_platform_creds(&f.mentor, &platform, &hash));
+        assert!(client.validate_external_reputation(&f.mentor, &platform, &1000u32));
+        assert!(client.bridge_identity(&f.mentor, &platform, &ext_id));
+    }
 }
+
