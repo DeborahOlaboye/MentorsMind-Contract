@@ -171,7 +171,47 @@ impl InsuranceContract {
             return Err(Error::InsufficientPoolBalance);
         }
 
-        env.storage().instance().set(&DataKey::PoolBalance, &(pool - amount));
+        // Validate fund conservation before making changes
+        let balance_before = pool;
+        let balance_after = pool - amount;
+
+        use shared::economic_verification::{validate_fund_conservation, record_invariant_check, EconomicInvariantRecord};
+
+        let validation = validate_fund_conservation(
+            &env,
+            balance_before,
+            0, // no inflows
+            amount, // claim payout is an outflow
+            0, // no fees
+            balance_after,
+        );
+
+        if !validation.valid {
+            // Record the failed check
+            let record = EconomicInvariantRecord {
+                invariant: validation.invariant,
+                valid: false,
+                observed: validation.observed,
+                expected: validation.expected,
+                timestamp: env.ledger().timestamp(),
+                ledger: env.ledger().sequence(),
+            };
+            record_invariant_check(&env, &record);
+            return Err(Error::InsufficientPoolBalance);
+        }
+
+        // Record successful validation
+        let record = EconomicInvariantRecord {
+            invariant: validation.invariant,
+            valid: true,
+            observed: validation.observed,
+            expected: validation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        };
+        record_invariant_check(&env, &record);
+
+        env.storage().instance().set(&DataKey::PoolBalance, &balance_after);
 
         let paid: i128 = env.storage().instance().get(&DataKey::TotalClaimsPaid).unwrap_or(0);
         env.storage()
@@ -492,5 +532,39 @@ mod tests {
             f.client().try_deposit(&f.provider, &0),
             Err(Ok(Error::ZeroAmount))
         );
+    }
+
+    #[test]
+    fn test_claim_validates_fund_conservation() {
+        let f = Fixture::setup();
+        f.client().deposit(&f.provider, &500_000);
+
+        let learner = Address::generate(&f.env);
+        let escrow_id = Symbol::new(&f.env, "session1");
+
+        // Valid claim should succeed and record validation
+        f.client().claim(&escrow_id, &learner, &200_000);
+
+        assert_eq!(f.client().get_pool_balance(), 300_000);
+        assert_eq!(f.client().get_total_claims_paid(), 200_000);
+    }
+
+    #[test]
+    fn test_claim_fund_conservation_prevents_invalid_payout() {
+        let f = Fixture::setup();
+        f.client().deposit(&f.provider, &100_000);
+
+        let learner = Address::generate(&f.env);
+        let escrow_id = Symbol::new(&f.env, "session2");
+
+        // Attempt claim exceeding pool balance
+        assert_eq!(
+            f.client().try_claim(&escrow_id, &learner, &200_000),
+            Err(Ok(Error::InsufficientPoolBalance))
+        );
+
+        // Pool balance should be unchanged
+        assert_eq!(f.client().get_pool_balance(), 100_000);
+        assert_eq!(f.client().get_total_claims_paid(), 0);
     }
 }
