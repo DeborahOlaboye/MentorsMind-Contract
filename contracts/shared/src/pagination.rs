@@ -21,8 +21,13 @@
 
 use soroban_sdk::Env;
 
+/// Hard ceiling on the number of items a single view may return.
+///
+/// Liquidation bots and governance tooling enumerate positions off-chain, so a
+/// page must stay small enough to fit inside a single transaction's budget.
 pub const MAX_PAGE_SIZE: u32 = 50;
 
+/// Inclusive/exclusive page window helper shared by every paginated view.
 pub struct Pagination {
     pub offset: u32,
     pub limit: u32,
@@ -33,16 +38,6 @@ impl Pagination {
         Self { offset, limit }
     }
 
-/// Hard ceiling on the number of items a single view may return.
-///
-/// Liquidation bots and governance tooling enumerate positions off-chain, so a
-/// page must stay small enough to fit inside a single transaction's budget.
-pub const MAX_PAGE_SIZE: u32 = 50;
-
-/// Inclusive/exclusive page window helper shared by every paginated view.
-pub struct Pagination;
-
-impl Pagination {
     /// Clamps `limit` and resolves `(offset, offset + limit)` against `total`.
     ///
     /// Returns a half-open range `[start, end)` that is always within
