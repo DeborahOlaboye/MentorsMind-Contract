@@ -265,6 +265,8 @@ pub enum Error {
     /// Dispute lacks sufficient evidence or has not cleared the mandatory
     /// deliberation cooldown (#886 payment-integrity protection).
     InsufficientEvidence = 19,
+    /// The dispute history indicates coordinated filing, so resolution is blocked.
+    DisputeIndependenceFlagged = 20,
 }
 
 #[contract]
@@ -662,6 +664,11 @@ impl DisputeEvidenceContract {
                     return Err(Error::ResolutionTimelockActive);
                 }
             }
+        }
+
+        let independence = Self::ensure_dispute_independence(env.clone(), escrow_id);
+        if !independence.independent {
+            return Err(Error::DisputeIndependenceFlagged);
         }
 
         let evidence_root = Self::get_evidence_root(env.clone(), escrow_id);
@@ -1501,7 +1508,14 @@ mod tests {
         }
     }
 
-    fn setup_disputed() -> (Env, Address, Address, Address, DisputeEvidenceContractClient<'static>) {
+    fn setup_disputed_with_contract_id() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        Address,
+        DisputeEvidenceContractClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -1510,7 +1524,13 @@ mod tests {
         let client = DisputeEvidenceContractClient::new(&env, &contract_id);
         client.initialize(&admin, &escrow_contract);
         let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&1);
-        (env, admin, escrow.mentor, escrow.learner, client)
+        (env, admin, escrow.mentor, escrow.learner, contract_id, client)
+    }
+
+    fn setup_disputed() -> (Env, Address, Address, Address, DisputeEvidenceContractClient<'static>) {
+        let (env, admin, mentor, learner, _contract_id, client) =
+            setup_disputed_with_contract_id();
+        (env, admin, mentor, learner, client)
     }
 
     #[contract]
@@ -1608,6 +1628,60 @@ mod tests {
         let events = env.events().all();
         let last = events.last().unwrap();
         assert_eq!(last.1, (Symbol::new(&env, "dispute_appealed"), 1u64).into_val(&env));
+    }
+
+    #[test]
+    fn test_submission_cooldown_enforced() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission should succeed
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Immediate resubmission should fail with cooldown error
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        assert_eq!(
+            client.try_submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None),
+            Err(Ok(Error::SubmissionCooldown))
+        );
+
+        // Advance time past cooldown
+        env.ledger().with_mut(|li| li.timestamp += SUBMISSION_COOLDOWN_SECS);
+
+        // Now resubmission should succeed
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify we have 2 evidence items
+        assert_eq!(client.get_evidence_count(&1), 2);
+    }
+
+    #[test]
+    fn test_submission_cooldown_can_be_disabled() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        env.ledger().set_timestamp(0);
+
+        // Disable cooldown
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client.record_dispute_opened(&1).unwrap();
+
+        // First submission
+        let hash1 = hash32(&env, 1);
+        let uri_hash1 = hash32(&env, 101);
+        client.submit_evidence(&1, &mentor, &hash1, &uri_hash1, &None).unwrap();
+
+        // Immediate resubmission should now succeed
+        let hash2 = hash32(&env, 2);
+        let uri_hash2 = hash32(&env, 102);
+        client.submit_evidence(&1, &mentor, &hash2, &uri_hash2, &None).unwrap();
+
+        // Verify we have 2 evidence items
+        assert_eq!(client.get_evidence_count(&1), 2);
     }
 
     #[test]
@@ -1865,6 +1939,7 @@ mod tests {
         let (env, admin, _mentor, _learner, client) = setup_disputed();
         let arbitrator = Address::generate(&env);
         client.record_dispute_opened(&1);
+        assert!(client.ensure_dispute_independence(&1).independent);
 
         advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
 
@@ -1875,6 +1950,37 @@ mod tests {
         assert_eq!(res.arbitrator, arbitrator);
         assert!(res.release_to_mentor);
         let _ = admin;
+    }
+
+    #[test]
+    fn resolution_rejects_flagged_dispute_independence() {
+        let (env, _admin, mentor, learner, contract_id, client) =
+            setup_disputed_with_contract_id();
+        let arbitrator = Address::generate(&env);
+        let mut party_log = Vec::new(&env);
+        party_log.push_back(1_000u64);
+        party_log.push_back(1_100u64);
+        party_log.push_back(1_200u64);
+
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(
+                &DataKey::PartyDisputeLog(mentor.clone(), learner.clone()),
+                &party_log,
+            );
+        });
+
+        client.record_dispute_opened(&1);
+        let independence = client.ensure_dispute_independence(&1);
+        assert!(!independence.independent);
+
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        let result = client.try_submit_resolution(
+            &1,
+            &arbitrator,
+            &true,
+            &Symbol::new(&env, "mentor_wins"),
+        );
+        assert_eq!(result, Err(Ok(Error::DisputeIndependenceFlagged)));
     }
 
     #[test]

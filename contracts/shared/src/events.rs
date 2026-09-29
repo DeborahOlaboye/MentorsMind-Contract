@@ -126,6 +126,15 @@ pub struct AdminChangeAcceptedEvent {
     pub new_admin: Address,
 }
 
+/// Admin change cancelled event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeCancelledEvent {
+    pub contract: Address,
+    pub cancelled_by: Address,
+    pub cancelled_new_admin: Address,
+}
+
 /// Proposal cancelled with cooldown event (governance).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,8 +310,11 @@ pub fn evt_gov_appeal_submitted(env: &Env)  -> Symbol { Symbol::new(env, "appeal
 pub fn evt_gov_appeal_resolved(env: &Env)   -> Symbol { Symbol::new(env, "appeal_res") }
 
 // --- staking ---
-pub fn evt_staking_staked(env: &Env)    -> Symbol { Symbol::new(env, "staked") }
-pub fn evt_staking_unstaked(env: &Env)  -> Symbol { Symbol::new(env, "unstaked") }
+pub fn evt_staking_staked(env: &Env)         -> Symbol { Symbol::new(env, "staked") }
+pub fn evt_staking_unstaked(env: &Env)       -> Symbol { Symbol::new(env, "unstaked") }
+pub fn evt_staking_admin_proposed(env: &Env) -> Symbol { Symbol::new(env, "admin_prop") }
+pub fn evt_staking_admin_accepted(env: &Env) -> Symbol { Symbol::new(env, "admin_acc") }
+pub fn evt_staking_admin_cancelled(env: &Env) -> Symbol { Symbol::new(env, "admin_cancel") }
 
 // --- timelock ---
 pub fn evt_timelock_init(env: &Env)     -> Symbol { Symbol::new(env, "initialized") }

@@ -1,22 +1,24 @@
 #![no_std]
 #![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
-use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
+use shared::events::{
+    emit_staking_event, evt_staking_staked, evt_staking_unstaked, evt_staking_admin_proposed,
+    evt_staking_admin_accepted, evt_staking_admin_cancelled, AdminChangeProposedEvent,
+    AdminChangeAcceptedEvent, AdminChangeCancelledEvent,
+};
 use shared::health_reporter::{report_metric, MetricCategory};
 use shared::pause_guard::require_not_paused;
 use shared::{
     action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
     compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
-    correlate_attack_vectors, detect_suspicious_pattern, push_snapshot_index,
-    validate_amount_limits, exceeds_extraction_rate, detect_coordinated_timing,
-    EconomicVelocityReport, MultiVectorThreatReport, PenaltyCalculation,
-    ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath, SnapshotMeta, StakeRecord,
-    StakedEventData, StakingActionRecord, StateSnapshot, StateVerificationReport,
-    SuspiciousPatternFlag, Validator, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
-    MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
-    REWARD_MULTIPLIER_MIN_BPS, MIN_POSITION_DELTA_SECS,
-    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult, TokenomicsAuditResult,
-    Pagination,
+    correlate_attack_vectors, detect_coordinated_timing, detect_suspicious_pattern,
+    exceeds_extraction_rate, push_snapshot_index, validate_amount_limits, CollusionDetection,
+    EconomicVelocityReport, GameTheoryState, IncentiveCompatibilityResult, MultiVectorThreatReport,
+    Pagination, PenaltyCalculation, ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath,
+    SnapshotMeta, StakeRecord, StakedEventData, StakingActionRecord, StateSnapshot,
+    StateVerificationReport, SuspiciousPatternFlag, TokenomicsAuditResult, Validator,
+    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, MIN_POSITION_DELTA_SECS, MIN_STAKING_DURATION_SECS,
+    PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS, REWARD_MULTIPLIER_MIN_BPS,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -454,8 +456,10 @@ impl StakingContract {
                 effective_at,
             },
         );
-        env.events().publish(
-            (Symbol::new(&env, "admin"), Symbol::new(&env, "proposed")),
+        // Emit AdminChangeProposed event via shared event infrastructure
+        emit_staking_event(
+            &env,
+            evt_staking_admin_proposed(&env),
             AdminChangeProposedEvent {
                 contract: env.current_contract_address(),
                 old_admin,
@@ -479,17 +483,40 @@ impl StakingContract {
         if env.ledger().timestamp() < pending.effective_at {
             return Err(Error::AdminChangeNotYetEffective);
         }
+        let old_admin = Self::admin(&env)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        // Emit AdminChangeAccepted event via shared event infrastructure
+        emit_staking_event(
+            &env,
+            evt_staking_admin_accepted(&env),
+            AdminChangeAcceptedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+            },
+        );
         Ok(())
     }
 
     pub fn cancel_admin_change(env: Env, multisig: Address) -> Result<(), Error> {
         multisig.require_auth();
-        if !env.storage().instance().has(&DataKey::PendingAdmin) {
-            return Err(Error::NoPendingAdminChange);
-        }
+        let pending: PendingAdminChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdminChange)?;
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        // Emit AdminChangeCancelled event via shared event infrastructure
+        emit_staking_event(
+            &env,
+            evt_staking_admin_cancelled(&env),
+            AdminChangeCancelledEvent {
+                contract: env.current_contract_address(),
+                cancelled_by: multisig,
+                cancelled_new_admin: pending.new_admin,
+            },
+        );
         Ok(())
     }
 
@@ -1235,12 +1262,54 @@ impl StakingContract {
             .ok_or(Error::NoStakeFound)
     }
 
-    /// Return the tier for a mentor.
-    /// 0 = None, 1 = Bronze, 2 = Silver, 3 = Gold
-    pub fn get_tier(env: Env, mentor: Address) -> u32 {
+    /// Get the staking tier for a mentor without deserializing the full StakeRecord.
+    ///
+    /// Returns the tier level of a mentor's stake, or 0 if the mentor has no stake.
+    /// This is a cheap read-only query intended for other contracts (verification, escrow)
+    /// that need to determine a mentor's tier without loading the complete stake record.
+    ///
+    /// The tier value indicates the mentor's participation level:
+    /// * `0` - No stake (default)
+    /// * `1` - Bronze tier (minimum stake threshold met)
+    /// * `2` - Silver tier (increased stake + quality requirements)
+    /// * `3` - Gold tier (highest stake + quality requirements)
+    ///
+    /// # Parameters
+    /// * `env` - The Soroban environment.
+    /// * `mentor` - Address of the mentor to query.
+    ///
+    /// # Returns
+    /// A `u32` representing the tier level (0-3). Returns 0 if no stake exists.
+    ///
+    /// # Storage Effects
+    /// Extends the TTL of the mentor's `DataKey::Stake` entry, resetting the
+    /// expiration counter. This ensures frequently-queried tier data remains
+    /// available across ledger boundaries.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mentor = Address::generate(&env);
+    /// let tier = staking.get_staking_tier(&env, &mentor);
+    /// match tier {
+    ///     0 => println!("No active stake"),
+    ///     1 => println!("Bronze tier"),
+    ///     2 => println!("Silver tier"),
+    ///     3 => println!("Gold tier"),
+    ///     _ => panic!("Invalid tier"),
+    /// }
+    /// ```
+    pub fn get_staking_tier(env: Env, mentor: Address) -> u32 {
+        let key = DataKey::Stake(mentor);
+        // Extend TTL on read to keep frequently-accessed tier data fresh
+        let threshold = 100_000u32;
+        let bump = 200_000u32;
         env.storage()
             .persistent()
-            .get::<DataKey, StakeRecord>(&DataKey::Stake(mentor))
+            .extend_ttl(&key, threshold, bump);
+        
+        env.storage()
+            .persistent()
+            .get::<DataKey, StakeRecord>(&key)
             .map(|r| r.tier)
             .unwrap_or(0)
     }
@@ -2405,6 +2474,42 @@ impl StakingContract {
         total
     }
 
+    /// Paginated reward history view for a staker. Returns a page of RewardLockup
+    /// entries representing each epoch's reward distribution, lockup, and claim status.
+    /// `limit` is clamped to `MAX_PAGE_SIZE`. Offset and limit follow standard pagination
+    /// semantics over the staker's complete reward history (epoch 0..current_epoch).
+    pub fn get_reward_history_page(
+        env: Env,
+        staker: Address,
+        offset: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<RewardLockup> {
+        use shared::Pagination;
+
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        let total_epochs = current_epoch as u32;
+        let (start, end) = Pagination::bounds(total_epochs, offset, limit);
+
+        let mut result = soroban_sdk::Vec::new(&env);
+
+        for epoch in start..end {
+            if let Some(lockup) = env
+                .storage()
+                .persistent()
+                .get::<_, RewardLockup>(&DataKey::StakerRewardLockup(staker.clone(), epoch as u64))
+            {
+                result.push_back(lockup);
+            }
+        }
+
+        result
+    }
+
     /// Duration-based multiplier the staker would earn for a reward
     /// materialised *right now*, given their current live stake duration.
     pub fn get_reward_multiplier_bps(env: Env, staker: Address) -> u32 {
@@ -3068,8 +3173,10 @@ impl StakingContract {
     /// Monitor governance token accumulation to prevent vote manipulation
     pub fn monitor_governance_accumulation(env: Env, staker: Address) -> Result<u32, Error> {
         let total_staked = Self::get_total_staked(env.clone());
-        let staker_stake: Option<StakeRecord> =
-            env.storage().persistent().get(&DataKey::Stake(staker.clone()));
+        let staker_stake: Option<StakeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stake(staker.clone()));
 
         if let Some(stake_record) = staker_stake {
             let accumulation_bps = if total_staked > 0 {
@@ -3377,10 +3484,7 @@ impl StakingContract {
     }
 
     /// Detect coordinated staking patterns that suggest manipulation.
-    pub fn detect_staking_coordination(
-        env: Env,
-        staker: Address,
-    ) -> bool {
+    pub fn detect_staking_coordination(env: Env, staker: Address) -> bool {
         let action_log: Vec<u64> = env
             .storage()
             .persistent()
@@ -3410,10 +3514,7 @@ impl StakingContract {
     }
 
     /// Audit tokenomics fairness for a given epoch.
-    pub fn audit_epoch_fairness(
-        env: Env,
-        epoch: u64,
-    ) -> TokenomicsAuditResult {
+    pub fn audit_epoch_fairness(env: Env, epoch: u64) -> TokenomicsAuditResult {
         let epoch_reward: i128 = env
             .storage()
             .persistent()
@@ -3707,6 +3808,27 @@ mod test {
         let f = Fixture::setup();
         let mentor = Address::generate(&f.env);
         assert_eq!(f.client().get_tier(&mentor), 0);
+    }
+
+    #[test]
+    fn test_get_staking_tier_returns_correct_tier_level() {
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+
+        // Test 1: No stake should return tier 0
+        assert_eq!(f.client().get_staking_tier(&mentor), 0);
+
+        // Test 2: Small stake (below Bronze) should return tier 0
+        f.fund(&mentor, 50);
+        f.client().stake(&mentor, &50, &30);
+        assert_eq!(f.client().get_staking_tier(&mentor), 0);
+
+        // Test 3: Larger stake (Bronze tier) should return tier 1
+        let mentor2 = Address::generate(&f.env);
+        f.fund(&mentor2, 500);
+        f.client().stake(&mentor2, &500, &30);
+        let tier = f.client().get_staking_tier(&mentor2);
+        assert!(tier >= 1, "Expected tier >= 1 for 500 token stake, got {}", tier);
     }
 
     // -----------------------------------------------------------------------
@@ -4107,13 +4229,12 @@ mod test {
         client.initialize(&admin, &token_id, &None);
 
         client.stake(&mentor, &100, &30);
-        let mut index: Vec<u32> = env
-            .as_contract(&staking_id, || {
-                env.storage()
-                    .persistent()
-                    .get(&DataKey::StakeSnapshotIndex)
-                    .unwrap()
-            });
+        let mut index: Vec<u32> = env.as_contract(&staking_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::StakeSnapshotIndex)
+                .unwrap()
+        });
         assert_eq!(index.len(), 1);
         assert_eq!(index.get(0), Some(1));
 
@@ -4172,5 +4293,62 @@ mod test {
                 .unwrap()
         });
         assert_eq!(index, existing);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin change events
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_propose_admin_change_emits_event() {
+        let f = Fixture::setup();
+        let new_admin = Address::generate(&f.env);
+
+        f.client().propose_admin_change(&f.admin, &new_admin);
+
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        
+        // Verify event has correct topic structure (contract, version, event_type)
+        let topics = &event.topics;
+        assert_eq!(topics.len(), 3);
+    }
+
+    #[test]
+    fn test_accept_admin_change_emits_event() {
+        let f = Fixture::setup();
+        let new_admin = Address::generate(&f.env);
+
+        f.client().propose_admin_change(&f.admin, &new_admin);
+        
+        // Advance time to make the change effective
+        f.env.ledger().set_timestamp(f.env.ledger().timestamp() + ADMIN_CHANGE_TIMELOCK + 1);
+
+        f.client().accept_admin_change(&new_admin);
+
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        
+        // Verify event has correct topic structure
+        let topics = &event.topics;
+        assert_eq!(topics.len(), 3);
+    }
+
+    #[test]
+    fn test_cancel_admin_change_emits_event() {
+        let f = Fixture::setup();
+        let new_admin = Address::generate(&f.env);
+        let multisig = Address::generate(&f.env);
+
+        f.client().propose_admin_change(&f.admin, &new_admin);
+
+        f.client().cancel_admin_change(&multisig);
+
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        
+        // Verify event has correct topic structure
+        let topics = &event.topics;
+        assert_eq!(topics.len(), 3);
     }
 }

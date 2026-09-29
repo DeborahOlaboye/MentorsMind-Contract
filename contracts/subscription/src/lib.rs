@@ -1,11 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
 
 use shared::{
     get_all_params, get_param, init_protocol_params, set_param,
     key_sub_expiry_grace,
     DEFAULT_SUB_EXPIRY_GRACE,
-    Pagination, MAX_PAGE_SIZE,
+    detect_fee_gaming, Pagination, PenaltyTier, MAX_PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,13 @@ pub const DEFAULT_PLATFORM_FEE_BPS: i128 = 250; // 2.5%
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    FeeGamingDetected = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +105,9 @@ pub enum DataKey {
     /// Cumulative revenue paid to a mentor, denominated per token.
     /// Key: (mentor, token) → i128 total received (net of platform fee).
     MentorRevenue(Address, Address),
+    /// Count and volume of successful early renewals, tracked per learner.
+    GraceRenewalCount(Address),
+    GraceRenewalVolume(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +198,35 @@ impl SubscriptionContract {
         env.storage()
             .persistent()
             .set(&DataKey::PlatformFeeBps, &DEFAULT_PLATFORM_FEE_BPS);
+    }
+
+    /// Initialize the shared governance parameter registry with its RBAC contract.
+    pub fn initialize_protocol_params(env: Env, admin: Address, rbac_contract: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("not admin");
+        }
+        init_protocol_params(&env, &rbac_contract);
+    }
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold `GOVERNANCE_ADMIN`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
     }
 
     // -----------------------------------------------------------------------
@@ -420,7 +459,7 @@ impl SubscriptionContract {
     /// timely renewal.  The subscription must also not have lapsed beyond
     /// `SUBSCRIPTION_EXPIRY_GRACE_SECS` past the billing date; if it has, the
     /// subscription is transitioned to `Expired` and renewal is rejected.
-    pub fn renew(env: Env, subscription_id: u32) {
+    pub fn renew(env: Env, subscription_id: u32) -> Result<(), Error> {
         let mut record: SubscriptionRecord = env
             .storage()
             .persistent()
@@ -453,7 +492,7 @@ impl SubscriptionContract {
                 (symbol_short!("expired"), subscription_id),
                 (record.learner, record.plan_id),
             );
-            return;
+            return Ok(());
         }
 
         // Apply grace period: allow renewal up to RENEWAL_GRACE_SECS before
@@ -504,7 +543,43 @@ impl SubscriptionContract {
                 },
             );
             // Return without panicking — state is correctly Expired.
-            return;
+            return Ok(());
+        }
+
+        let is_grace_renewal = now < record.next_billing_date;
+        let prior_grace_renewals: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraceRenewalCount(record.learner.clone()))
+            .unwrap_or(0);
+        let prior_grace_volume: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GraceRenewalVolume(record.learner.clone()))
+            .unwrap_or(0);
+        let renewal_count = prior_grace_renewals
+            .saturating_add(if is_grace_renewal { 1 } else { 0 });
+        let renewal_volume = if is_grace_renewal {
+            prior_grace_volume.saturating_add(required)
+        } else {
+            prior_grace_volume
+        };
+        let fee_gaming = detect_fee_gaming(&env, renewal_count, renewal_volume);
+        let penalty_tier = if fee_gaming.is_evading {
+            PenaltyTier::PermanentBan
+        } else {
+            PenaltyTier::None
+        };
+        if penalty_tier == PenaltyTier::PermanentBan {
+            return Err(Error::FeeGamingDetected);
+        }
+        if is_grace_renewal {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GraceRenewalCount(record.learner.clone()), &renewal_count);
+            env.storage()
+                .persistent()
+                .set(&DataKey::GraceRenewalVolume(record.learner.clone()), &renewal_volume);
         }
 
         // Deduct from the pre-authorized allowance first.
@@ -526,6 +601,7 @@ impl SubscriptionContract {
             (symbol_short!("renewed"), subscription_id),
             (record.learner, record.plan_id),
         );
+        Ok(())
     }
 
     /// Cancel a subscription — learner only, effective end of billing period.
@@ -1031,11 +1107,28 @@ impl SubscriptionContract {
 #[cfg(test)]
 mod test {
     use super::*;
+    use shared::{
+        key_cooldown_days, key_interest_rate_bps, key_min_bond, key_min_credit_score,
+        key_platform_fee_bps, key_sub_expiry_grace, key_tier_bronze, key_tier_gold,
+        key_tier_silver, DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND,
+        DEFAULT_MIN_CREDIT_SCORE, DEFAULT_PLATFORM_FEE_BPS as DEFAULT_PARAM_PLATFORM_FEE_BPS,
+        DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD, DEFAULT_TIER_SILVER,
+    };
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
         Address, Env,
     };
+
+    #[contract]
+    pub struct MockRbac;
+
+    #[contractimpl]
+    impl MockRbac {
+        pub fn has_role(_env: Env, _role: Symbol, _account: Address) -> bool {
+            true
+        }
+    }
 
     fn setup() -> (Env, SubscriptionContractClient<'static>, Address, Address, Address, Address) {
         let env = Env::default();
@@ -1051,6 +1144,35 @@ mod test {
 
         client.initialize(&admin, &escrow);
         (env, client, admin, escrow, mentor, learner)
+    }
+
+    #[test]
+    fn test_get_all_params_defaults_and_updates() {
+        let (env, client, admin, _, _, _) = setup();
+        let params = client.get_all_params();
+        let expected = [
+            (key_min_bond(), DEFAULT_MIN_BOND),
+            (key_min_credit_score(), DEFAULT_MIN_CREDIT_SCORE),
+            (key_interest_rate_bps(), DEFAULT_INTEREST_RATE_BPS),
+            (key_platform_fee_bps(), DEFAULT_PARAM_PLATFORM_FEE_BPS),
+            (key_cooldown_days(), DEFAULT_COOLDOWN_DAYS),
+            (key_tier_bronze(), DEFAULT_TIER_BRONZE),
+            (key_tier_silver(), DEFAULT_TIER_SILVER),
+            (key_tier_gold(), DEFAULT_TIER_GOLD),
+            (key_sub_expiry_grace(), DEFAULT_SUB_EXPIRY_GRACE),
+        ];
+
+        assert_eq!(params.len(), expected.len() as u32);
+        for (index, expected_param) in expected.iter().enumerate() {
+            assert_eq!(params.get(index as u32).unwrap(), *expected_param);
+        }
+
+        let rbac_id = env.register_contract(None, MockRbac);
+        client.initialize_protocol_params(&admin, &rbac_id);
+        client.set_param(&admin, &key_interest_rate_bps(), &350);
+
+        let updated = client.get_all_params();
+        assert_eq!(updated.get(2).unwrap(), (key_interest_rate_bps(), 350));
     }
 
     fn create_token<'a>(
@@ -1150,6 +1272,37 @@ mod test {
 
         client.renew(&sub_id);
         assert_eq!(token.balance(&escrow), 200);
+    }
+
+    #[test]
+    fn test_repeated_grace_window_renewals_trigger_fee_gaming_error() {
+        let (env, client, admin, _escrow, mentor, learner) = setup();
+        let (token_address, _token, token_admin) = create_token(&env, &admin, &client);
+        approve_token(&env, &client, &admin, &token_address);
+        token_admin.mint(&learner, &5000);
+
+        let plan_id = client.create_plan(&mentor, &100i128, &token_address, &5u32);
+        let sub_id = client.subscribe(&learner, &plan_id);
+
+        for _ in 0..20 {
+            let record = client.get_subscription(&sub_id);
+            env.ledger().with_mut(|ledger| {
+                ledger.timestamp = record.next_billing_date - RENEWAL_GRACE_SECS;
+            });
+            client.authorize_renewal(&sub_id, &100i128);
+            client.renew(&sub_id);
+        }
+
+        let record = client.get_subscription(&sub_id);
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp = record.next_billing_date - RENEWAL_GRACE_SECS;
+        });
+        client.authorize_renewal(&sub_id, &100i128);
+
+        assert!(matches!(
+            client.try_renew(&sub_id),
+            Err(Ok(Error::FeeGamingDetected))
+        ));
     }
 
     #[test]

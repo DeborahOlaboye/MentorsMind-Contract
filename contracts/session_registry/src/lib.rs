@@ -378,6 +378,40 @@ impl SessionRegistry {
             Self::enforce_fair_pricing(env.clone(), learner.clone(), mentor.clone(), amount);
         Self::assess_learner_vulnerability(env.clone(), learner.clone(), mentor.clone(), amount);
 
+        // Welfare check: read the vulnerability record just written above and
+        // compute the learner's welfare status.  Session creation is NOT
+        // blocked — this is advisory only.  If the learner is at high risk
+        // a LearnerWelfareAlert event is emitted so off-chain monitors can act.
+        {
+            let vulnerability: VulnerabilityAssessment = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LearnerVulnerabilityRecord(
+                    learner.clone(),
+                    mentor.clone(),
+                ))
+                .unwrap_or(VulnerabilityAssessment {
+                    at_risk: false,
+                    risk_score: 0,
+                    high_recurrence: false,
+                    affordability_concern: false,
+                    recurrence_count: 0,
+                });
+            // No exploitation patterns are available at registration time;
+            // use 0 so welfare_risk_score mirrors the vulnerability score alone.
+            let welfare = shared_compute_welfare_status(vulnerability, 0);
+            if welfare.support_required {
+                env.events().publish(
+                    (
+                        symbol_short!("welfare"),
+                        Symbol::new(&env, "LearnerWelfareAlert"),
+                        learner.clone(),
+                    ),
+                    (mentor.clone(), welfare.welfare_risk_score),
+                );
+            }
+        }
+
         // Scalability protection: track requested booking-capacity units and
         // re-score this mentor's resource-competition/load risk before
         // committing state (#scalability-protection).
