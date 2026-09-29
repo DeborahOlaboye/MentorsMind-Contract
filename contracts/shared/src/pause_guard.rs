@@ -118,6 +118,7 @@ pub fn unpause(env: &Env) {
     set_paused(env, false);
 }
 
+/// Writes the raw flag without an authorisation check.
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&PAUSE_FLAG, &paused);
 }
