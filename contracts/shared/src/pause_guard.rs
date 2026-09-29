@@ -69,6 +69,16 @@ pub fn pause_state(env: &Env) -> PauseState {
     }
 }
 
+pub fn pause_guard_is_paused(env: &Env) -> bool {
+    pause_state(env).is_paused()
+}
+
+pub fn require_not_paused_locally(env: &Env) {
+    if pause_guard_is_paused(env) {
+        panic!("contract paused");
+    }
+}
+
 /// Check local instance pause flag.
 pub fn is_paused_local(env: &Env) -> bool {
     pause_state(env).is_paused()

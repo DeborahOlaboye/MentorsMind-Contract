@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, token, Address, Env, Symbol,
 };
+use shared::{validate_amount_limits, MAX_FINANCIAL_AMOUNT};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -19,6 +20,7 @@ pub enum Error {
     WithdrawLocked          = 5,
     InsufficientPoolBalance = 6,
     ZeroAmount              = 7,
+    AmountExceedsLimit      = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,8 +81,12 @@ impl InsuranceContract {
     /// Deposit USDC into the insurance pool.
     pub fn deposit(env: Env, provider: Address, amount: i128) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
-        if amount <= 0 {
-            return Err(Error::ZeroAmount);
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
+            return if amount <= 0 {
+                Err(Error::ZeroAmount)
+            } else {
+                Err(Error::AmountExceedsLimit)
+            };
         }
         provider.require_auth();
 
@@ -159,8 +165,12 @@ impl InsuranceContract {
     /// Admin only.
     pub fn claim(env: Env, escrow_id: Symbol, learner: Address, amount: i128) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
-        if amount <= 0 {
-            return Err(Error::ZeroAmount);
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
+            return if amount <= 0 {
+                Err(Error::ZeroAmount)
+            } else {
+                Err(Error::AmountExceedsLimit)
+            };
         }
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -491,6 +501,42 @@ mod tests {
         assert_eq!(
             f.client().try_deposit(&f.provider, &0),
             Err(Ok(Error::ZeroAmount))
+        );
+    }
+
+    #[test]
+    fn test_amount_exceeds_limit() {
+        let f = Fixture::setup();
+        // Try to deposit more than MAX_FINANCIAL_AMOUNT
+        let exceeds = 1_000_000_000_000_001i128; // MAX_FINANCIAL_AMOUNT + 1
+        assert_eq!(
+            f.client().try_deposit(&f.provider, &exceeds),
+            Err(Ok(Error::AmountExceedsLimit))
+        );
+    }
+
+    #[test]
+    fn test_claim_zero_amount_rejected() {
+        let f = Fixture::setup();
+        let learner = Address::generate(&f.env);
+        let escrow_id = Symbol::new(&f.env, "session1");
+        assert_eq!(
+            f.client().try_claim(&escrow_id, &learner, &0),
+            Err(Ok(Error::ZeroAmount))
+        );
+    }
+
+    #[test]
+    fn test_claim_amount_exceeds_limit() {
+        let f = Fixture::setup();
+        f.client().deposit(&f.provider, &500_000);
+        
+        let learner = Address::generate(&f.env);
+        let escrow_id = Symbol::new(&f.env, "session2");
+        let exceeds = 1_000_000_000_000_001i128; // MAX_FINANCIAL_AMOUNT + 1
+        assert_eq!(
+            f.client().try_claim(&escrow_id, &learner, &exceeds),
+            Err(Ok(Error::AmountExceedsLimit))
         );
     }
 }
